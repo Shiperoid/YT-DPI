@@ -1,6 +1,6 @@
 #!/bin/sh
 # Bootstrap: запускаем скрипт в bash, включая окружения Entware.
-if [ -z "${BASH_VERSION:-}" ]; then
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH##*/}" = "sh" ]; then
     if command -v bash >/dev/null 2>&1; then
         exec bash "$0" "$@"
     elif [ -x /opt/bin/bash ]; then
@@ -90,7 +90,8 @@ if [[ "$OSTYPE" == "darwin"* ]]; then OS_MAC=true; fi
 # Во время скана используем более редкий poll, чтобы не грузить CPU.
 READ_TIMEOUT="0.05"
 SCAN_READ_TIMEOUT="${YT_DPI_SCAN_READ_TIMEOUT:-0.2}"
-if (( BASH_VERSINFO[0] < 4 )); then READ_TIMEOUT="1"; fi
+DRAIN_READ_TIMEOUT="0.1"
+if (( BASH_VERSINFO[0] < 4 )); then READ_TIMEOUT="1"; SCAN_READ_TIMEOUT="1"; DRAIN_READ_TIMEOUT="1"; fi
 # Параллельных worker одновременно (каждый — fork + несколько curl). 0 = без лимита (как раньше «все сразу»).
 SCAN_MAX_JOBS="${YT_DPI_MAX_JOBS:-}"
 if [[ -z "$SCAN_MAX_JOBS" ]] || [[ ! "$SCAN_MAX_JOBS" =~ ^[0-9]+$ ]]; then
@@ -301,7 +302,10 @@ rebuild_targets() {
     local x
     for x in "${BASE_TARGETS[@]}"; do raw+=("$x"); done
     [[ -n "${CDN:-}" ]] && raw+=("$CDN")
-    mapfile -t TARGETS < <(printf '%s\n' "${raw[@]}" | awk '!seen[$0]++' | awk '{ print length"\t"$0 }' | sort -n | cut -f2-)
+    TARGETS=()
+    while IFS= read -r x; do
+        TARGETS+=("$x")
+    done < <(printf '%s\n' "${raw[@]}" | awk '!seen[$0]++' | awk '{ print length"\t"$0 }' | sort -n | cut -f2-)
 }
 
 # Тики .NET совместимо с geo_cache из YT-DPI.ps1 для расчёта TTL.
@@ -1187,9 +1191,10 @@ while true; do
             out_str $X_VER $row $W_VER "PREPARING..." "$C_GRY"
             JOB_STATE[$i]=1
             if (( SCAN_MAX_JOBS > 0 )); then
-                while (( running_jobs >= SCAN_MAX_JOBS )); do
-                    wait -n 2>/dev/null || sleep 0.05
-                    ((running_jobs--))
+                while true; do
+                    running_jobs=$(jobs -rp 2>/dev/null | wc -l | tr -d ' ')
+                    (( running_jobs < SCAN_MAX_JOBS )) && break
+                    sleep 0.1
                 done
             fi
             worker "${TARGETS[$i]}" "$row" < /dev/null &
@@ -1236,6 +1241,6 @@ while true; do
             out_str 2 $UI_Y 121 "$NAV_DONE" "$C_GRN"
         fi
         flush_buffer
-        while read -t 0.1 -n 1 -s; do : ; done
+        while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
     fi
 done
