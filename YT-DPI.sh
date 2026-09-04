@@ -17,8 +17,20 @@ fi
 # Часть настроек хранится в ~/.config/yt-dpi/config.json (если установлен jq).
 
 # Инициализация TUI: скрываем ввод/курсор и переходим в альтернативный экран (только при TTY).
+# Сохраняем начальные настройки терминала, чтобы корректно восстанавливать их при входе в подменю
+# (bash 3.2 на macOS не всегда восстанавливает icanon/icrnl после read -n 1).
+_STTY_SAVE=""
+[ -t 0 ] && _STTY_SAVE=$(stty -g 2>/dev/null) || true
+
 tui_leave() {
-    [ -t 0 ] && stty echo 2>/dev/null || true
+    if [ -t 0 ]; then
+        if [ -n "$_STTY_SAVE" ]; then
+            stty "$_STTY_SAVE" 2>/dev/null || true
+        else
+            stty echo 2>/dev/null || true
+            stty icanon 2>/dev/null || true
+        fi
+    fi
     printf '\033[?25h\033[?1049l'
 }
 
@@ -40,12 +52,16 @@ trap 'cleanup' INT TERM EXIT
 
 tui_enter
 
-for cmd in curl awk; do
+_required_cmds="curl awk"
+[[ "$OSTYPE" == "darwin"* ]] && _required_cmds="$_required_cmds openssl"
+for cmd in $_required_cmds; do
     if ! command -v $cmd &> /dev/null; then
         echo "Error: $cmd is required." >&2
+        [[ "$cmd" == "openssl" ]] && echo "  Install Xcode Command Line Tools: xcode-select --install" >&2
         exit 1
     fi
 done
+unset _required_cmds
 
 # Один и тот же curl, что даёт command -v (не только /usr/bin/curl).
 CURL_BIN=$(command -v curl)
@@ -981,6 +997,36 @@ resolve_target_ip() {
     return 0
 }
 
+# Запуск команды с таймаутом: timeout(1) → gtimeout → perl alarm → без таймаута.
+_run_timeout() {
+    local secs=$1; shift
+    if command -v timeout &>/dev/null; then
+        timeout "$secs" "$@"
+    elif command -v gtimeout &>/dev/null; then
+        gtimeout "$secs" "$@"
+    elif command -v perl &>/dev/null; then
+        perl -e "alarm($secs); exec @ARGV" -- "$@"
+    else
+        "$@"
+    fi
+}
+
+# Проверка TLS 1.3 через openssl s_client (fallback для macOS, где curl собран без TLS 1.3).
+# Не использует прокси — вызывать только при прямом подключении.
+_tls13_openssl() {
+    local target="$1"
+    local out
+    out=$(echo Q | _run_timeout 3 openssl s_client -tls1_3 \
+        -connect "${target}:443" -servername "$target" 2>&1)
+    if echo "$out" | grep -q "Protocol  : TLSv1.3"; then
+        echo "OK"
+    elif echo "$out" | grep -qiE "reset|RST"; then
+        echo "RST"
+    else
+        echo "DRP"
+    fi
+}
+
 # Рабочий поток проверки одной цели.
 # Формат результата: IP|HTTP|TLS12|TLS13|LAT|VERDICT|COLOR
 worker() {
@@ -1022,13 +1068,15 @@ worker() {
 
     if [[ "$TLS_MODE" == "TLS13" ]]; then
         t12="---"
-        if ! $CURL_HAS_TLS13; then
+        if $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
+            t13=$(_tls13_openssl "$target")
+        elif ! $CURL_HAS_TLS13; then
             t13="N/A"
         else
-            local t13_out
-            t13_out=$(LC_ALL=C curl -k -s -m 3 "${curl_px[@]}" -I "https://$target" --tlsv1.3 2>&1)
-            if [ $? -eq 0 ]; then t13="OK"
-            elif echo "$t13_out" | grep -qiE "unsupported|not supported|unknown option|unrecognized option|built-in"; then t13="N/A"
+            local t13_out ec13_s
+            t13_out=$(LC_ALL=C curl -k -sS -m 3 "${curl_px[@]}" -I "https://$target" --tlsv1.3 2>&1); ec13_s=$?
+            if [ $ec13_s -eq 0 ]; then t13="OK"
+            elif [ $ec13_s -eq 4 ] || echo "$t13_out" | grep -qiE "unsupported|not supported|unknown option|unrecognized option|built-in"; then t13="N/A"
             elif echo "$t13_out" | grep -qi "reset"; then t13="RST"
             else t13="DRP"
             fi
@@ -1039,7 +1087,7 @@ worker() {
             t12="N/A"
         else
             local t12_out
-            t12_out=$(curl -k -s -m 3 "${curl_px[@]}" -I "https://$target" --tls-max 1.2 2>&1)
+            t12_out=$(curl -k -sS -m 3 "${curl_px[@]}" -I "https://$target" --tls-max 1.2 2>&1)
             if [ $? -eq 0 ]; then t12="OK"
             elif echo "$t12_out" | grep -qi "reset"; then t12="RST"
             else t12="DRP"
@@ -1049,13 +1097,13 @@ worker() {
         # Auto: обе проверки TLS независимы — параллельно, чтобы не суммировать таймауты.
         local t12_tmp="$TMP_DIR/w.${row}.12" t13_tmp="$TMP_DIR/w.${row}.13" t12_out t13_out ec12 ec13 pid12 pid13
         if $CURL_HAS_TLS_MAX; then
-            curl -k -s -m 3 "${curl_px[@]}" -I "https://$target" --tls-max 1.2 >"$t12_tmp" 2>&1 & pid12=$!
+            curl -k -sS -m 3 "${curl_px[@]}" -I "https://$target" --tls-max 1.2 >"$t12_tmp" 2>&1 & pid12=$!
         else
             : >"$t12_tmp"
             ec12=2
         fi
         if $CURL_HAS_TLS13; then
-            LC_ALL=C curl -k -s -m 3 "${curl_px[@]}" -I "https://$target" --tlsv1.3 >"$t13_tmp" 2>&1 & pid13=$!
+            LC_ALL=C curl -k -sS -m 3 "${curl_px[@]}" -I "https://$target" --tlsv1.3 >"$t13_tmp" 2>&1 & pid13=$!
         else
             : >"$t13_tmp"
             ec13=2
@@ -1072,9 +1120,11 @@ worker() {
         elif echo "$t12_out" | grep -qi "reset"; then t12="RST"
         else t12="DRP"
         fi
-        if ! $CURL_HAS_TLS13; then t13="N/A"
+        if $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
+            t13=$(_tls13_openssl "$target")
+        elif ! $CURL_HAS_TLS13; then t13="N/A"
         elif [ "$ec13" -eq 0 ]; then t13="OK"
-        elif echo "$t13_out" | grep -qiE "unsupported|not supported|unknown option|unrecognized option|built-in"; then t13="N/A"
+        elif [ "$ec13" -eq 4 ] || echo "$t13_out" | grep -qiE "unsupported|not supported|unknown option|unrecognized option|built-in"; then t13="N/A"
         elif echo "$t13_out" | grep -qi "reset"; then t13="RST"
         else t13="DRP"
         fi
@@ -1132,13 +1182,15 @@ while true; do
 
     read -t $READ_TIMEOUT -n 1 -s key
     READ_STATUS=$?
+    # bash 3.2 does not clear the variable on timeout — stale key would re-fire hotkeys
+    [[ $READ_STATUS -ne 0 ]] && key=""
 
     # Горячие клавиши: EN и те же физические клавиши под RU (ЙЦУКЕН).
     if [[ "$key" == "q" || "$key" == "Q" || "$key" == "й" || "$key" == "Й" || "$key" == $'\e' ]]; then break
-    elif [[ "$key" == "h" || "$key" == "H" || "$key" == "р" || "$key" == "Р" ]]; then show_help; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer
-    elif [[ "$key" == "s" || "$key" == "S" || "$key" == "ы" || "$key" == "Ы" ]]; then show_settings_menu; get_network_info; rebuild_targets; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer
-    elif [[ "$key" == "p" || "$key" == "P" || "$key" == "з" || "$key" == "З" ]]; then show_proxy_menu; get_network_info; rebuild_targets; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer
-    elif [[ "$key" == "t" || "$key" == "T" || "$key" == "е" || "$key" == "Е" ]]; then test_proxy; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer
+    elif [[ "$key" == "h" || "$key" == "H" || "$key" == "р" || "$key" == "Р" ]]; then show_help; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
+    elif [[ "$key" == "s" || "$key" == "S" || "$key" == "ы" || "$key" == "Ы" ]]; then show_settings_menu; get_network_info; rebuild_targets; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
+    elif [[ "$key" == "p" || "$key" == "P" || "$key" == "з" || "$key" == "З" ]]; then show_proxy_menu; get_network_info; rebuild_targets; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
+    elif [[ "$key" == "t" || "$key" == "T" || "$key" == "е" || "$key" == "Е" ]]; then test_proxy; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
     elif [[ "$key" == "r" || "$key" == "R" || "$key" == "к" || "$key" == "К" ]]; then
         out_str 2 $UI_Y 121 "[ WAIT ] SAVING REPORT..." "$C_CYA"; flush_buffer
         LOG="YT-DPI_Report.txt"
