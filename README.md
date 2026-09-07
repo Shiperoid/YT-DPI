@@ -353,10 +353,10 @@ YT-DPI.bat --help
 
 Проект опирается на исследования сообщества DPI:
 
-* [GoodbyeDPI](https://github.com/ValdikSS/GoodbyeDPI) — ValdikSS  
-* [Zapret](https://github.com/bol-van/zapret) — bol-van  
-* [B4](https://github.com/DanielLavrushin/b4) — Даниил Лаврушин  
-* [dpi-detector](https://github.com/Runnin4ik/dpi-detector)
+* [GoodbyeDPI](https://github.com/ValdikSS/GoodbyeDPI) - ValdikSS  
+* [Zapret](https://github.com/bol-van/zapret) - bol-van  
+* [B4](https://github.com/DanielLavrushin/b4) - DanielLavrushin  
+* [dpi-detector](https://github.com/Runnin4ik/dpi-detector) - Runnin4ik
 
 **Лицензия:** MIT. Инструмент только для **диагностики**. Не является средством обхода блокировок.
 
