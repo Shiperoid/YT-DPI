@@ -1,7 +1,8 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Smoke: AST parse YT-DPI.ps1 + patterns (List, Task.Delay, Runspace) used by scan / NetInfo paths.
+  Smoke: AST parse YT-DPI.ps1 + YT-DPI.v3.extras.ps1, v3.0 symbol patterns,
+  plus List/Task.Delay/Runspace checks used by scan / NetInfo paths.
   Outputs [PASS]/[FAIL]/[SKIP] lines; on parse errors prints file, line, column, snippet.
 .NOTES
   Part of release gate compatibility matrix — not application E2E.
@@ -96,6 +97,58 @@ if ($errs -and $errs.Count -gt 0) {
     exit 1
 }
 Write-SmokeStep -Status PASS -Phase 'AST parse'
+
+$mainRawForV3 = [System.IO.File]::ReadAllText($ytDpi, [System.Text.UTF8Encoding]::new($false))
+$v3Required = @(
+    'function Invoke-DnsCompareProbe',
+    'function Invoke-QuicUdpProbe',
+    'function Invoke-Tcp16Probe',
+    'function Invoke-IpVsSniProbe',
+    'function Build-Recommendations',
+    'function Invoke-BatchSuite',
+    'function Invoke-BypassToolsSelfCheck',
+    'function Show-BypassWarningBanner',
+    'function Export-YtDpiJsonReport',
+    'function Invoke-PostScanExtras',
+    'function Invoke-DnsScanAction',
+    'function Flush-UiFrame',
+    'function Invoke-IcmpTtlPathProbe',
+    'function Draw-ExtraStrip'
+)
+$missingV3 = @()
+foreach ($pat in $v3Required) {
+    if ($mainRawForV3 -notlike "*$pat*") { $missingV3 += $pat }
+}
+if ($mainRawForV3 -notmatch '\$scriptVersion\s*=\s*"3\.0"') {
+    $missingV3 += 'scriptVersion 3.0'
+}
+if ($mainRawForV3 -notmatch 'RstPhase') {
+    $missingV3 += 'RstPhase in YT-DPI.ps1'
+}
+if ($mainRawForV3 -notmatch '--batch') {
+    $missingV3 += '--batch CLI'
+}
+if ($mainRawForV3 -notmatch '\[D\] DNS') {
+    $missingV3 += 'NAV [D] DNS'
+}
+if ($mainRawForV3 -notmatch '\[G\] PATH') {
+    $missingV3 += 'NAV [G] PATH'
+}
+if ($mainRawForV3 -match 'function Trace-TcpRoute|function Invoke-TraceAction|AdvancedTraceroute|\$traceCode\s*=') {
+    $missingV3 += 'Deep Trace leftovers (must be removed)'
+}
+if ($mainRawForV3 -match 'YT-DPI\.v3\.extras\.ps1') {
+    $missingV3 += 'extras file reference (must be inlined)'
+}
+$extrasPath = Join-Path $RepoRoot 'YT-DPI.v3.extras.ps1'
+if (Test-Path -LiteralPath $extrasPath) {
+    $missingV3 += 'YT-DPI.v3.extras.ps1 must be deleted (inlined)'
+}
+if ($missingV3.Count -gt 0) {
+    Write-SmokeStep -Status FAIL -Phase 'v3.0 symbols' -Detail ($missingV3 -join '; ')
+    exit 1
+}
+Write-SmokeStep -Status PASS -Phase 'v3.0 symbols' -Detail ("{0} inlined extras + TUI/PATH" -f $v3Required.Count)
 
 if (-not $SkipWorkerArity) {
     try {

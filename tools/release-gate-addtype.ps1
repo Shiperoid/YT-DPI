@@ -1,12 +1,12 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Compiles TLS + traceroute C# snippets extracted from YT-DPI.ps1 (fresh process).
-  Uses [PASS]/[FAIL]/[SKIP] lines aligned with release-gate.ps1.
+  Compiles TLS C# snippet extracted from YT-DPI.ps1 (fresh process).
+  Traceroute/Deep Trace removed in 3.0 — TracePath is optional legacy no-op.
 #>
 param(
     [Parameter(Mandatory)][string]$TlsPath,
-    [Parameter(Mandatory)][string]$TracePath,
+    [string]$TracePath = $null,
     [string]$RepoRoot = $null,
     [switch]$SkipSmoke,
     [switch]$Quiet
@@ -33,31 +33,21 @@ if (-not (Test-Path -LiteralPath $TlsPath)) {
     Write-AddTypeStep -Status FAIL -Phase 'read TLS path' -Detail $TlsPath
     throw "TLS file missing: $TlsPath"
 }
-if (-not (Test-Path -LiteralPath $TracePath)) {
-    Write-AddTypeStep -Status FAIL -Phase 'read Trace path' -Detail $TracePath
-    throw "Trace file missing: $TracePath"
-}
 Write-AddTypeStep -Status PASS -Phase 'read snippet paths'
 
 $tls = [System.IO.File]::ReadAllText($TlsPath, [System.Text.Encoding]::UTF8)
-$tr = [System.IO.File]::ReadAllText($TracePath, [System.Text.Encoding]::UTF8)
 Write-AddTypeStep -Status PASS -Phase 'read snippet UTF-8'
 
 if ([string]::IsNullOrWhiteSpace($tls)) {
     Write-AddTypeStep -Status FAIL -Phase 'TLS snippet empty'
     throw 'TLS snippet is empty after extract.'
 }
-if ([string]::IsNullOrWhiteSpace($tr)) {
-    Write-AddTypeStep -Status FAIL -Phase 'Traceroute snippet empty'
-    throw 'Traceroute snippet is empty after extract.'
-}
 if ($tls -notmatch '(?m)\bclass\s+TlsScanner\b') {
     Write-AddTypeStep -Status FAIL -Phase 'TLS snippet sanity' -Detail 'no type TlsScanner'
     throw 'TLS snippet sanity: expected type name TlsScanner.'
 }
-if ($tr -notmatch '(?m)\bclass\s+AdvancedTraceroute\b') {
-    Write-AddTypeStep -Status FAIL -Phase 'Trace snippet sanity' -Detail 'no AdvancedTraceroute'
-    throw 'Trace snippet sanity: expected type AdvancedTraceroute.'
+if ($TracePath -and (Test-Path -LiteralPath $TracePath)) {
+    Write-AddTypeStep -Status SKIP -Phase 'traceroute snippet' -Detail 'Deep Trace removed in 3.0'
 }
 Write-AddTypeStep -Status PASS -Phase 'snippet sanity'
 
@@ -70,14 +60,6 @@ try {
     Write-Host ('[FAIL] Exception: {0}' -f $_.Exception) -ForegroundColor Red
     throw
 }
-try {
-    Add-Type -TypeDefinition $tr -ErrorAction Stop
-} catch {
-    Write-AddTypeStep -Status FAIL -Phase 'Add-Type traceroute (AdvancedTraceroute)'
-    Write-Host ('[FAIL] TracePath={0}' -f $TracePath) -ForegroundColor Red
-    Write-Host ('[FAIL] Exception: {0}' -f $_.Exception) -ForegroundColor Red
-    throw
-}
 $swCompile.Stop()
 
 try {
@@ -85,12 +67,6 @@ try {
 } catch {
     Write-AddTypeStep -Status FAIL -Phase 'type resolve TlsScanner'
     throw "TlsScanner type not visible after Add-Type: $_"
-}
-try {
-    $null = [AdvancedTraceroute]
-} catch {
-    Write-AddTypeStep -Status FAIL -Phase 'type resolve AdvancedTraceroute'
-    throw "AdvancedTraceroute type not visible after Add-Type: $_"
 }
 Write-AddTypeStep -Status PASS -Phase 'Add-Type compile + type resolve' -Detail ('{0} ms' -f [int]$swCompile.Elapsed.TotalMilliseconds)
 
