@@ -8,7 +8,7 @@
 
 **YT-DPI** — диагностический инструмент для анализа вмешательства DPI и ТСПУ в доступ к YouTube и связанным доменам. На **Windows** основной код в **`YT-DPI.ps1`** (PowerShell и низкоуровневое ядро на **C#** для сборки TLS на уровне байтов); рядом лежит **тонкий** **`YT-DPI.bat`**, который только запускает `pwsh` / `powershell` и при отсутствии `.ps1` может однократно подтянуть его с GitHub. Редакция **`YT-DPI.sh`** (Bash: Linux, macOS, **Git Bash** на Windows, **Entware** на роутерах) выполняет проверки через `curl` и ту же логику вердиктов, что и Windows-версия.
 
-![Preview](https://raw.githubusercontent.com/Shiperoid/YT-DPI/refs/heads/master/img/YT-DPI-v2.2.3.png)
+![Preview](https://raw.githubusercontent.com/Shiperoid/YT-DPI/refs/heads/master/img/YT-DPI-v3.0.png)
 
 ## Что нового в v2.3.3 (Windows, кратко)
 
