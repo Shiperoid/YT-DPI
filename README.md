@@ -15,7 +15,7 @@
 
 Движок Windows в баннере: **Barebuh Pro v3.1 / TUI v1.2**. Bash: **Barebuh Pro v2.3.7** (логика через `curl`). Подробный diff Windows 2.3.3 → 3.0 — в [CHANGELOG.md](CHANGELOG.md).
 
-![Preview](https://raw.githubusercontent.com/Shiperoid/YT-DPI/refs/heads/master/img/YT-DPI-v2.2.3.png)
+![Preview](https://raw.githubusercontent.com/Shiperoid/YT-DPI/refs/heads/master/img/YT-DPI-v3.0.png)
 
 ---
 
