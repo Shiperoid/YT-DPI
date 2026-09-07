@@ -47,68 +47,42 @@ cleanup() {
 
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
+# YT_DPI_LIB_ONLY=1 — только функции (для smoke), без TUI и сетевых проверок при старте.
+_YT_DPI_LIB_ONLY=false
+[[ "${YT_DPI_LIB_ONLY:-}" == "1" ]] && _YT_DPI_LIB_ONLY=true
+
 TMP_DIR=""
-trap 'cleanup' INT TERM EXIT
-
-tui_enter
-
-_required_cmds="curl awk"
-[[ "$OSTYPE" == "darwin"* ]] && _required_cmds="$_required_cmds openssl"
-for cmd in $_required_cmds; do
-    if ! command -v $cmd &> /dev/null; then
-        echo "Error: $cmd is required." >&2
-        [[ "$cmd" == "openssl" ]] && echo "  Install Xcode Command Line Tools: xcode-select --install" >&2
-        exit 1
-    fi
-done
-unset _required_cmds
-
-# Один и тот же curl, что даёт command -v (не только /usr/bin/curl).
-CURL_BIN=$(command -v curl)
-curl() { "$CURL_BIN" "$@"; }
-
-# Проверка, поддерживает ли текущий curl конкретный флаг.
-curl_supports_opt() {
-    local opt="$1"
-    curl --help all 2>/dev/null | awk -v o="$opt" 'index($0, o) { found=1; exit } END { exit(found?0:1) }'
-}
-
-# Не все curl-сборки на роутерах поддерживают одинаковые TLS- и SOCKS-флаги.
-CURL_HAS_TLS13=false
-CURL_HAS_TLS_MAX=false
-CURL_HAS_SOCKS5H=false
-curl_supports_opt "--tlsv1.3" && CURL_HAS_TLS13=true
-curl_supports_opt "--tls-max" && CURL_HAS_TLS_MAX=true
-curl_supports_opt "socks5h://" && CURL_HAS_SOCKS5H=true
-
-proxy_url_for_curl() {
-    local px="$1"
-    if [[ "$px" == socks5://* ]] && ! $CURL_HAS_SOCKS5H; then
-        echo "$px"
-        return 0
-    fi
-    if [[ "$px" == socks5://* ]]; then
-        echo "${px/socks5:\/\//socks5h:\/\/}"
-        return 0
-    fi
-    echo "$px"
-}
-
-if ! TMP_DIR=$(mktemp -d); then
-    echo "Error: mktemp failed (cannot create temp dir)." >&2
-    exit 1
+if ! $_YT_DPI_LIB_ONLY; then
+    trap 'cleanup' INT TERM EXIT
+    tui_enter
 fi
 
 OS_MAC=false
 if [[ "$OSTYPE" == "darwin"* ]]; then OS_MAC=true; fi
 
+SCRIPT_VERSION="2.3.3"
+# Каталог скрипта (targets.txt / debug log рядом с файлом).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+[[ -z "$SCRIPT_DIR" ]] && SCRIPT_DIR="."
+TARGETS_FILE="$SCRIPT_DIR/targets.txt"
+DEBUG_LOG_FILE="$SCRIPT_DIR/YT-DPI_Debug.log"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/yt-dpi"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+GEO_CACHE_FILE="$CONFIG_DIR/geo_cache.json"
+
+# Таймауты (секунды для curl -m), аналог $CONST в YT-DPI.ps1.
+HTTP_TIMEOUT_S=2
+TLS_FAST_S=3
+TLS_RETRY_S=5
+GEO_CURL_S=2
+CDN_CURL_S=3
+
 # Опрос клавиш в главном меню (idle) и во время скана.
-# Во время скана используем более редкий poll, чтобы не грузить CPU.
 READ_TIMEOUT="0.05"
 SCAN_READ_TIMEOUT="${YT_DPI_SCAN_READ_TIMEOUT:-0.2}"
 DRAIN_READ_TIMEOUT="0.1"
 if (( BASH_VERSINFO[0] < 4 )); then READ_TIMEOUT="1"; SCAN_READ_TIMEOUT="1"; DRAIN_READ_TIMEOUT="1"; fi
-# Параллельных worker одновременно (каждый — fork + несколько curl). 0 = без лимита (как раньше «все сразу»).
 SCAN_MAX_JOBS="${YT_DPI_MAX_JOBS:-}"
 if [[ -z "$SCAN_MAX_JOBS" ]] || [[ ! "$SCAN_MAX_JOBS" =~ ^[0-9]+$ ]]; then
     if [[ -n "${MSYSTEM:-}" ]]; then SCAN_MAX_JOBS=6
@@ -125,15 +99,16 @@ fi
 
 E=$'\033'
 
-SCRIPT_VERSION="2.3.2"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/yt-dpi"
-CONFIG_FILE="$CONFIG_DIR/config.json"
-GEO_CACHE_FILE="$CONFIG_DIR/geo_cache.json"
-
-# Блок runtime-настроек (формат совместим с bat-версией по основным полям).
+# Runtime-настройки (формат совместим с YT-DPI.ps1 по основным полям).
 export IP_PREFERENCE="IPv6"
 export TLS_MODE="Auto"
 HAS_IPV6=false
+USE_CUSTOM_TARGETS=false
+DEBUG_LOG_ENABLED=false
+DEBUG_LOG_FULL_IDS=false
+DEBUG_SESSION_HEADER_WRITTEN=false
+HAS_COMPLETED_SCAN=false
+LAST_SCAN_SUMMARY=""
 
 PROXY_ENABLED=false
 PROXY_TYPE="HTTP"
@@ -146,7 +121,57 @@ PROXY_STR=""
 PROXY_HISTORY=()
 
 TARGETS=()
+CUSTOM_TARGETS=()
 CDN=""
+TARGETS_FROM_CUSTOM=false
+
+CURL_BIN=""
+CURL_HAS_TLS13=false
+CURL_HAS_TLS_MAX=false
+CURL_HAS_SOCKS5H=false
+
+if ! $_YT_DPI_LIB_ONLY; then
+    _required_cmds="curl awk"
+    [[ "$OSTYPE" == "darwin"* ]] && _required_cmds="$_required_cmds openssl"
+    for cmd in $_required_cmds; do
+        if ! command -v $cmd &> /dev/null; then
+            echo "Error: $cmd is required." >&2
+            [[ "$cmd" == "openssl" ]] && echo "  Install Xcode Command Line Tools: xcode-select --install" >&2
+            exit 1
+        fi
+    done
+    unset _required_cmds
+
+    CURL_BIN=$(command -v curl)
+    curl() { "$CURL_BIN" "$@"; }
+
+    curl_supports_opt() {
+        local opt="$1"
+        curl --help all 2>/dev/null | awk -v o="$opt" 'index($0, o) { found=1; exit } END { exit(found?0:1) }'
+    }
+
+    curl_supports_opt "--tlsv1.3" && CURL_HAS_TLS13=true
+    curl_supports_opt "--tls-max" && CURL_HAS_TLS_MAX=true
+    curl_supports_opt "socks5h://" && CURL_HAS_SOCKS5H=true
+
+    if ! TMP_DIR=$(mktemp -d); then
+        echo "Error: mktemp failed (cannot create temp dir)." >&2
+        exit 1
+    fi
+fi
+
+proxy_url_for_curl() {
+    local px="$1"
+    if [[ "$px" == socks5://* ]] && ! $CURL_HAS_SOCKS5H; then
+        echo "$px"
+        return 0
+    fi
+    if [[ "$px" == socks5://* ]]; then
+        echo "${px/socks5:\/\//socks5h:\/\/}"
+        return 0
+    fi
+    echo "$px"
+}
 
 # Базовый список целей для сканирования.
 BASE_TARGETS=(
@@ -194,7 +219,6 @@ NAV_ABORT="[ ABORTED ] SCAN STOPPED. [ENTER] SCAN | [S] SETTINGS | [P] PROXY | [
 NAV_DONE="[ SUCCESS ] SCAN FINISHED. [ENTER] SCAN | [S] SETTINGS | [P] PROXY | [T] TEST | [R] REPORT | [H] HELP | [Q] QUIT"
 
 FRAME_BUFFER=""
-# Запись строки в буфер кадра (без немедленной отправки в терминал).
 out_str() {
     local x=$1 y=$2 w=$3 text=$4 color=$5
     local padded
@@ -203,8 +227,102 @@ out_str() {
 }
 flush_buffer() { printf "%b" "$FRAME_BUFFER"; FRAME_BUFFER=""; }
 
-# Проверка доступности jq (нужен только для работы с JSON-конфигом).
 have_jq() { command -v jq &>/dev/null; }
+
+_bool_json() {
+    if [[ "$1" == true ]] || [[ "$1" == "1" ]] || [[ "$1" == "true" ]]; then echo true; else echo false; fi
+}
+
+# Вердикт по двум TLS-ячейкам (как Set-Verdict-DualTlsCells в PS). Печатает: VERDICT|COLOR_CODE
+# COLOR_CODE: G=green Y=yellow R=red
+set_verdict_dual_tls() {
+    local cell12="$1" cell13="$2"
+    local t12_ok=false t13_ok=false t12_blocked=false t13_blocked=false
+    [[ "$cell12" == "OK" ]] && t12_ok=true
+    [[ "$cell13" == "OK" ]] && t13_ok=true
+    [[ "$cell12" == "RST" || "$cell12" == "DRP" ]] && t12_blocked=true
+    [[ "$cell13" == "RST" || "$cell13" == "DRP" ]] && t13_blocked=true
+
+    if $t12_ok && $t13_ok; then echo "AVAILABLE|G"; return; fi
+    if $t12_ok || $t13_ok; then
+        if $t12_blocked || $t13_blocked; then echo "THROTTLED|Y"; return; fi
+        echo "AVAILABLE|G"; return
+    fi
+    if [[ "$cell12" == "RST" || "$cell13" == "RST" ]]; then echo "DPI RESET|R"; return; fi
+    if [[ "$cell12" == "DRP" || "$cell13" == "DRP" ]]; then echo "DPI BLOCK|Y"; return; fi
+    echo "IP BLOCK|R"
+}
+
+# Парсинг строк targets.txt: stdin → stdout (валидные домены).
+parse_targets_lines() {
+    awk '
+        {
+            gsub(/\r/, "")
+            line = $0
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            if (line == "" || line ~ /^#/) next
+            if (index(line, ".") == 0) next
+            print line
+        }
+    '
+}
+
+debug_log_enabled() {
+    local env_raw="${YT_DPI_DEBUG:-}"
+    if [[ "$env_raw" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then return 0; fi
+    if [[ "${DEBUG_LOG_ENABLED}" == true ]] || [[ "${DEBUG_LOG_ENABLED}" == "1" ]]; then return 0; fi
+    return 1
+}
+
+debug_log_full_ids() {
+    local env_raw="${YT_DPI_DEBUG_IDENTIFIERS:-}"
+    if [[ "$env_raw" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then return 0; fi
+    if [[ "${DEBUG_LOG_FULL_IDS}" == true ]] || [[ "${DEBUG_LOG_FULL_IDS}" == "1" ]]; then return 0; fi
+    return 1
+}
+
+debug_log() {
+    debug_log_enabled || return 0
+    local msg="$1" level="${2:-DEBUG}"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) || ts="?"
+    printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$DEBUG_LOG_FILE" 2>/dev/null || true
+}
+
+debug_log_session_header_if_needed() {
+    debug_log_enabled || return 0
+    [[ "${DEBUG_SESSION_HEADER_WRITTEN}" == true ]] && return 0
+    DEBUG_SESSION_HEADER_WRITTEN=true
+    debug_log "==================== YT-DPI SESSION START ====================" "INFO"
+    debug_log "Скрипт версия: $SCRIPT_VERSION (bash)" "INFO"
+    debug_log "ОС: ${OSTYPE:-unknown} | Bash: ${BASH_VERSION:-unknown} | PID: $$" "INFO"
+    if debug_log_full_ids; then
+        debug_log "Host: $(hostname 2>/dev/null || echo unknown) | User: ${USER:-${USERNAME:-unknown}}" "INFO"
+        debug_log "Путь к скрипту: ${BASH_SOURCE[0]:-unknown}" "INFO"
+        debug_log "Рабочая папка: $(pwd 2>/dev/null)" "INFO"
+        debug_log "Лог-файл: $DEBUG_LOG_FILE" "INFO"
+    else
+        debug_log "Host/User: [обезличено] (полные данные: п.5 в настройках или YT_DPI_DEBUG_IDENTIFIERS=1)" "INFO"
+        debug_log "Путь к скрипту: [обезличено] (только имя: $(basename "${BASH_SOURCE[0]:-YT-DPI.sh}"))" "INFO"
+        debug_log "Лог-файл: YT-DPI_Debug.log (рядом со скриптом)" "INFO"
+    fi
+    if $TARGETS_FROM_CUSTOM; then
+        debug_log "Список целей: загружен из кастомного файла (${#TARGETS[@]} шт.)" "INFO"
+    else
+        debug_log "Список целей: используется встроенный список (${#TARGETS[@]} шт.)" "INFO"
+        [[ -n "${CDN:-}" ]] && debug_log "Примечание: встроенный список может быть дополнен CDN: $CDN" "INFO"
+    fi
+    debug_log "============================================================" "INFO"
+}
+
+color_from_code() {
+    case "$1" in
+        G) echo "$C_GRN" ;;
+        Y) echo "$C_YEL" ;;
+        R) echo "$C_RED" ;;
+        *) echo "$C_WHT" ;;
+    esac
+}
 
 # Сохранение настроек в JSON-конфиг.
 config_save() {
@@ -212,9 +330,12 @@ config_save() {
     mkdir -p "$CONFIG_DIR" || return 1
     local hist_json
     hist_json=$(printf '%s\n' "${PROXY_HISTORY[@]}" | jq -R . 2>/dev/null | jq -s . 2>/dev/null) || hist_json='[]'
-    local pe=false
-    if [[ "${PROXY_ENABLED}" == true ]] || [[ "${PROXY_ENABLED}" == "1" ]]; then pe=true; fi
-    local pj port_safe
+    local pe uct dbg full
+    pe=$(_bool_json "$PROXY_ENABLED")
+    uct=$(_bool_json "$USE_CUSTOM_TARGETS")
+    dbg=$(_bool_json "$DEBUG_LOG_ENABLED")
+    full=$(_bool_json "$DEBUG_LOG_FULL_IDS")
+    local port_safe
     port_safe="${PROXY_PORT:-0}"
     [[ "$port_safe" =~ ^[0-9]+$ ]] || port_safe=0
     jq -n \
@@ -227,15 +348,36 @@ config_save() {
         --arg User "${PROXY_USER:-}" \
         --arg Pass "${PROXY_PASS:-}" \
         --argjson History "$hist_json" \
-        '{IpPreference:$IpPreference,TlsMode:$TlsMode,Proxy:{Enabled:$ProxyEnabled,Type:$Type,Host:$Host,Port:$Port,User:$User,Pass:$Pass},ProxyHistory:$History}' \
+        --argjson UseCustomTargets "$uct" \
+        --argjson DebugLogEnabled "$dbg" \
+        --argjson DebugLogFullIdentifiers "$full" \
+        '{IpPreference:$IpPreference,TlsMode:$TlsMode,Proxy:{Enabled:$ProxyEnabled,Type:$Type,Host:$Host,Port:$Port,User:$User,Pass:$Pass},ProxyHistory:$History,UseCustomTargets:$UseCustomTargets,DebugLogEnabled:$DebugLogEnabled,DebugLogFullIdentifiers:$DebugLogFullIdentifiers}' \
         > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 }
 
 config_load() {
+    # Авто-init UseCustomTargets без jq: файл рядом со скриптом.
+    if [[ -f "$TARGETS_FILE" ]]; then
+        USE_CUSTOM_TARGETS=true
+    fi
     have_jq || return 0
     [[ -f "$CONFIG_FILE" ]] || return 0
     IP_PREFERENCE=$(jq -r '.IpPreference // "IPv6"' "$CONFIG_FILE")
     TLS_MODE=$(jq -r '.TlsMode // "Auto"' "$CONFIG_FILE")
+
+    local uct_raw dbg_raw full_raw
+    uct_raw=$(jq -r 'if has("UseCustomTargets") then (.UseCustomTargets|tostring) else "MISSING" end' "$CONFIG_FILE" 2>/dev/null)
+    if [[ "$uct_raw" == "MISSING" ]]; then
+        if [[ -f "$TARGETS_FILE" ]]; then USE_CUSTOM_TARGETS=true; else USE_CUSTOM_TARGETS=false; fi
+    elif [[ "$uct_raw" == "true" ]]; then USE_CUSTOM_TARGETS=true
+    else USE_CUSTOM_TARGETS=false
+    fi
+
+    dbg_raw=$(jq -r '.DebugLogEnabled // false' "$CONFIG_FILE")
+    full_raw=$(jq -r '.DebugLogFullIdentifiers // false' "$CONFIG_FILE")
+    [[ "$dbg_raw" == "true" ]] && DEBUG_LOG_ENABLED=true || DEBUG_LOG_ENABLED=false
+    [[ "$full_raw" == "true" ]] && DEBUG_LOG_FULL_IDS=true || DEBUG_LOG_FULL_IDS=false
+
     PROXY_HISTORY=()
     local line
     while IFS= read -r line; do
@@ -312,16 +454,69 @@ detect_ipv6() {
     done
 }
 
-# BaseTargets без manifest: узел вида manifest / rN.* задаёт только CDN после redirector (локальный CDN-шард).
+# Загрузка целей: кастомный targets.txt или встроенный список (+ CDN только для встроенного).
+initialize_targets() {
+    CUSTOM_TARGETS=()
+    TARGETS_FROM_CUSTOM=false
+    debug_log "=== initialize_targets: START ===" "DEBUG"
+
+    if [[ "${USE_CUSTOM_TARGETS}" == true ]] || [[ "${USE_CUSTOM_TARGETS}" == "1" ]]; then
+        if [[ -f "$TARGETS_FILE" ]]; then
+            local line
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && CUSTOM_TARGETS+=("$line")
+            done < <(parse_targets_lines < "$TARGETS_FILE")
+            if ((${#CUSTOM_TARGETS[@]} > 0)); then
+                TARGETS_FROM_CUSTOM=true
+                debug_log "Загружено ${#CUSTOM_TARGETS[@]} целей из $TARGETS_FILE" "INFO"
+                return 0
+            fi
+            debug_log "Кастомный файл пуст или без валидных строк — fallback на встроенный" "WARN"
+        else
+            debug_log "targets.txt не найден при UseCustomTargets=true" "DEBUG"
+        fi
+    fi
+    debug_log "Используется встроенный список (${#BASE_TARGETS[@]} шт.)" "INFO"
+}
+
 rebuild_targets() {
+    initialize_targets
     local -a raw=()
     local x
-    for x in "${BASE_TARGETS[@]}"; do raw+=("$x"); done
-    [[ -n "${CDN:-}" ]] && raw+=("$CDN")
+    if $TARGETS_FROM_CUSTOM; then
+        for x in "${CUSTOM_TARGETS[@]}"; do raw+=("$x"); done
+    else
+        for x in "${BASE_TARGETS[@]}"; do raw+=("$x"); done
+        [[ -n "${CDN:-}" ]] && raw+=("$CDN")
+    fi
     TARGETS=()
     while IFS= read -r x; do
         TARGETS+=("$x")
     done < <(printf '%s\n' "${raw[@]}" | awk '!seen[$0]++' | awk '{ print length"\t"$0 }' | sort -n | cut -f2-)
+}
+
+export_targets_to_file() {
+    local list_src=()
+    local x
+    if $TARGETS_FROM_CUSTOM && ((${#CUSTOM_TARGETS[@]} > 0)); then
+        list_src=("${CUSTOM_TARGETS[@]}")
+    else
+        list_src=("${BASE_TARGETS[@]}")
+    fi
+    if ((${#list_src[@]} == 0)); then
+        echo -e "\n${C_RED}[ОШИБКА] Нет целей для экспорта!${C_RST}"
+        return 1
+    fi
+    {
+        echo "# YT-DPI targets.txt — экспортировано $(date '+%Y-%m-%d %H:%M:%S')"
+        for x in "${list_src[@]}"; do echo "$x"; done
+    } > "$TARGETS_FILE"
+    USE_CUSTOM_TARGETS=true
+    config_save
+    initialize_targets
+    rebuild_targets
+    echo -e "\n${C_GRN}[OK] Экспортировано ${#list_src[@]} целей в:${C_RST}\n       $TARGETS_FILE"
+    return 0
 }
 
 # Тики .NET совместимо с geo_cache из YT-DPI.ps1 для расчёта TTL.
@@ -490,7 +685,7 @@ resolve_cdn_from_redirector() {
     local curl_px=() rnd cdn_raw cdn_short
     if [[ "${PROXY_ENABLED}" == true ]] || [[ "${PROXY_ENABLED}" == "1" ]]; then curl_px=( -x "$PROXY_STR" ); fi
     rnd=$(awk 'BEGIN { srand(); print int(1048576 * rand()) }')
-    cdn_raw=$(curl -s -m 3 -A "curl/7.88.1" "${curl_px[@]}" "http://redirector.googlevideo.com/report_mapping?di=no&nocache=$rnd" 2>/dev/null) || true
+    cdn_raw=$(curl -s -m "${CDN_CURL_S:-3}" -A "curl/7.88.1" "${curl_px[@]}" "http://redirector.googlevideo.com/report_mapping?di=no&nocache=$rnd" 2>/dev/null) || true
     [[ -z "$cdn_raw" ]] && return
 
     if [[ "$cdn_raw" =~ =\>[[:space:]]+([A-Za-z0-9-]+) ]]; then
@@ -717,45 +912,125 @@ show_help() {
 
     echo -e "\n${C_YEL}[ RESULT ]${C_RST}"
     echo -e "  ${C_GRN}AVAILABLE     - TLS passed. Domain is fully accessible.${C_RST}"
-    echo -e "  ${C_YEL}DPI BLOCK     - HTTP works, but TLS is blocked/dropped.${C_RST}"
-    echo -e "  ${C_YEL}THROTTLED     - HTTP works, but one TLS version is blocked.${C_RST}"
-    echo -e "  ${C_RED}IP  BLOCK     - Both HTTP and TLS are unreachable.${C_RST}"
+    echo -e "  ${C_RED}DPI RESET     - HTTP works; TLS reset (RST) — classic DPI injection.${C_RST}"
+    echo -e "  ${C_YEL}DPI BLOCK     - HTTP works; TLS dropped/timeout (DRP).${C_RST}"
+    echo -e "  ${C_YEL}THROTTLED     - HTTP works; one TLS version OK, the other blocked.${C_RST}"
+    echo -e "  ${C_RED}IP BLOCK      - Both HTTP and TLS are unreachable.${C_RST}"
     echo -e "  ${C_RED}ROUTING ERROR - Network issues, proxy failure, bad routing.${C_RST}"
+
+    echo -e "\n${C_GRY}Bash edition: no [D] Deep Trace / [U] Update (Windows YT-DPI.ps1 only).${C_RST}"
 
     echo -ne "\n${C_CYA}PRESS ANY KEY TO RETURN...${C_RST}"
     read -r -n 1 -s
     tui_enter
 }
 
-# Меню общих настроек сканера (IP preference и TLS mode).
+# Меню настроек — нумерация как в YT-DPI.ps1.
 show_settings_menu() {
-    tui_leave
-    clear
-    echo -e "${C_CYA}=== SETTINGS (как в YT-DPI.bat, упрощённо) ===${C_RST}"
-    echo -e "  IpPreference: ${C_YEL}$IP_PREFERENCE${C_RST}   TlsMode: ${C_YEL}$TLS_MODE${C_RST}"
-    echo -e "  IPv6 detected: ${C_YEL}$HAS_IPV6${C_RST}"
-    echo -e "\n${C_CYA}Выберите:${C_RST}"
-    echo -e "  ${C_GRY}1${C_RST} — IpPreference: IPv6"
-    echo -e "  ${C_GRY}2${C_RST} — IpPreference: IPv4"
-    echo -e "  ${C_GRY}3${C_RST} — TlsMode: Auto"
-    echo -e "  ${C_GRY}4${C_RST} — TlsMode: TLS12"
-    echo -e "  ${C_GRY}5${C_RST} — TlsMode: TLS13"
-    echo -e "  ${C_GRY}Enter${C_RST} — назад"
-    echo -ne "\n${C_YEL}> ${C_RST}"
-    local c
-    read -r c
-    case "$c" in
-        1) IP_PREFERENCE="IPv6" ;;
-        2) IP_PREFERENCE="IPv4" ;;
-        3) TLS_MODE="Auto" ;;
-        4) TLS_MODE="TLS12" ;;
-        5) TLS_MODE="TLS13" ;;
-        *) tui_enter; return 0 ;;
-    esac
-    config_save
-    echo -e "\n${C_GRN}[OK] Сохранено.${C_RST}"
-    sleep 1
-    tui_enter
+    while true; do
+        tui_leave
+        clear
+        local cur_uct="ВЫКЛ" cur_dbg="ВЫКЛ" cur_full="ВЫКЛ (обезличено)"
+        [[ "${USE_CUSTOM_TARGETS}" == true || "${USE_CUSTOM_TARGETS}" == "1" ]] && cur_uct="ВКЛ"
+        [[ "${DEBUG_LOG_ENABLED}" == true || "${DEBUG_LOG_ENABLED}" == "1" ]] && cur_dbg="ВКЛ"
+        [[ "${DEBUG_LOG_FULL_IDS}" == true || "${DEBUG_LOG_FULL_IDS}" == "1" ]] && cur_full="ВКЛ — host/user/paths"
+
+        echo -e "${C_CYA}=== SETTINGS / НАСТРОЙКИ (YT-DPI.sh v${SCRIPT_VERSION}) ===${C_RST}"
+        echo -e "  IPv6 detected: ${C_YEL}$HAS_IPV6${C_RST}"
+
+        echo -e "\n  ${C_WHT}1. Протокол IP :${C_RST} ${C_YEL}[ $IP_PREFERENCE ]${C_RST}"
+        echo -e "     ${C_GRY}(IPv6 приоритет с откатом / только IPv4)${C_RST}"
+
+        echo -e "\n  ${C_WHT}2. Сброс сетевого кэша${C_RST}"
+        echo -e "     ${C_GRY}(гео-кэш и данные о провайдере)${C_RST}"
+
+        echo -e "\n  ${C_WHT}3. Режим TLS :${C_RST} ${C_CYA}[ $TLS_MODE ]${C_RST}"
+        echo -e "     ${C_GRY}Auto → TLS12 → TLS13 → Auto. В single-mode теневая проверка другой версии только для вердикта.${C_RST}"
+
+        echo -e "\n  ${C_WHT}4. Запись отладки в файл :${C_RST} ${C_YEL}[ $cur_dbg ]${C_RST}"
+        echo -e "     ${C_GRY}Файл: YT-DPI_Debug.log | env YT_DPI_DEBUG=1${C_RST}"
+
+        echo -e "\n  ${C_WHT}5. Полные идентификаторы в логе :${C_RST} ${C_YEL}[ $cur_full ]${C_RST}"
+        echo -e "     ${C_GRY}env YT_DPI_DEBUG_IDENTIFIERS=1${C_RST}"
+
+        echo -e "\n  ${C_WHT}6. Кастомный файл целей (targets.txt) :${C_RST} ${C_YEL}[ $cur_uct ]${C_RST}"
+        echo -e "     ${C_GRY}$TARGETS_FILE${C_RST}"
+
+        echo -e "\n  ${C_WHT}7. Экспортировать текущие цели в targets.txt${C_RST}"
+        echo -e "     ${C_GRY}(после экспорта кастомный режим ВКЛ)${C_RST}"
+
+        echo -e "\n  ${C_GRY}0 / Enter — назад${C_RST}"
+        echo -ne "\n${C_YEL} ВЫБЕРИТЕ ПУНКТ (1–7, 0): ${C_RST}"
+        local c
+        read -r c
+        case "$c" in
+            1)
+                if [[ "$IP_PREFERENCE" == "IPv6" ]]; then IP_PREFERENCE="IPv4"; else IP_PREFERENCE="IPv6"; fi
+                config_save
+                echo -e "\n${C_GRN}[OK] IpPreference: $IP_PREFERENCE${C_RST}"; sleep 1
+                ;;
+            2)
+                rm -f "$GEO_CACHE_FILE" 2>/dev/null || true
+                ISP="Loading..."; LOC="Unknown"
+                echo -e "\n${C_GRN}[OK] Кэш очищен!${C_RST}"; sleep 1
+                ;;
+            3)
+                case "$TLS_MODE" in
+                    Auto|auto) TLS_MODE="TLS12" ;;
+                    TLS12|tls12) TLS_MODE="TLS13" ;;
+                    *) TLS_MODE="Auto" ;;
+                esac
+                config_save
+                echo -e "\n${C_GRN}[OK] Режим TLS: $TLS_MODE${C_RST}"; sleep 1
+                ;;
+            4)
+                if [[ "${DEBUG_LOG_ENABLED}" == true || "${DEBUG_LOG_ENABLED}" == "1" ]]; then
+                    DEBUG_LOG_ENABLED=false
+                else
+                    DEBUG_LOG_ENABLED=true
+                    DEBUG_SESSION_HEADER_WRITTEN=false
+                    debug_log_session_header_if_needed
+                fi
+                config_save
+                echo -e "\n${C_GRN}[OK] Debug log: $DEBUG_LOG_ENABLED${C_RST}"; sleep 1
+                ;;
+            5)
+                if [[ "${DEBUG_LOG_FULL_IDS}" == true || "${DEBUG_LOG_FULL_IDS}" == "1" ]]; then
+                    DEBUG_LOG_FULL_IDS=false
+                else
+                    DEBUG_LOG_FULL_IDS=true
+                fi
+                config_save
+                if debug_log_enabled; then
+                    DEBUG_SESSION_HEADER_WRITTEN=false
+                    debug_log_session_header_if_needed
+                fi
+                echo -e "\n${C_GRN}[OK] Full identifiers: $DEBUG_LOG_FULL_IDS${C_RST}"; sleep 1
+                ;;
+            6)
+                if [[ "${USE_CUSTOM_TARGETS}" == true || "${USE_CUSTOM_TARGETS}" == "1" ]]; then
+                    USE_CUSTOM_TARGETS=false
+                else
+                    USE_CUSTOM_TARGETS=true
+                fi
+                config_save
+                rebuild_targets
+                echo -e "\n${C_GRN}[OK] UseCustomTargets: $USE_CUSTOM_TARGETS (${#TARGETS[@]} целей)${C_RST}"; sleep 1
+                ;;
+            7)
+                export_targets_to_file
+                sleep 2
+                ;;
+            0|"")
+                tui_enter
+                return 0
+                ;;
+            *)
+                tui_enter
+                return 0
+                ;;
+        esac
+    done
 }
 
 # Применение записи из истории прокси.
@@ -1011,12 +1286,45 @@ _run_timeout() {
     fi
 }
 
-# Проверка TLS 1.3 через openssl s_client (fallback для macOS, где curl собран без TLS 1.3).
-# Не использует прокси — вызывать только при прямом подключении.
+# Классификация ответа curl TLS → OK|RST|DRP|N/A
+_tls_classify_curl() {
+    local ec=$1 out=$2
+    if [ "$ec" -eq 0 ]; then echo "OK"; return; fi
+    if [ "$ec" -eq 4 ] || echo "$out" | grep -qiE "unsupported|not supported|unknown option|unrecognized option|built-in"; then
+        echo "N/A"; return
+    fi
+    if echo "$out" | grep -qi "reset"; then echo "RST"; return; fi
+    echo "DRP"
+}
+
+# Проба TLS 1.2 (curl --tls-max 1.2). $1=target $2=timeout_s; curl_px через глобальный контекст worker.
+_probe_tls12() {
+    local target="$1" to="$2"
+    local -a px=("${@:3}")
+    if ! $CURL_HAS_TLS_MAX; then echo "N/A"; return; fi
+    local out ec
+    out=$(curl -k -sS -m "$to" "${px[@]}" -I "https://$target" --tls-max 1.2 2>&1); ec=$?
+    _tls_classify_curl "$ec" "$out"
+}
+
+_probe_tls13() {
+    local target="$1" to="$2"
+    local -a px=("${@:3}")
+    if $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
+        _tls13_openssl "$target" "$to"
+        return
+    fi
+    if ! $CURL_HAS_TLS13; then echo "N/A"; return; fi
+    local out ec
+    out=$(LC_ALL=C curl -k -sS -m "$to" "${px[@]}" -I "https://$target" --tlsv1.3 2>&1); ec=$?
+    _tls_classify_curl "$ec" "$out"
+}
+
+# TLS 1.3 через openssl s_client (fallback для macOS).
 _tls13_openssl() {
-    local target="$1"
+    local target="$1" to="${2:-$TLS_FAST_S}"
     local out
-    out=$(echo Q | _run_timeout 3 openssl s_client -tls1_3 \
+    out=$(echo Q | _run_timeout "$to" openssl s_client -tls1_3 \
         -connect "${target}:443" -servername "$target" 2>&1)
     if echo "$out" | grep -q "Protocol  : TLSv1.3"; then
         echo "OK"
@@ -1027,11 +1335,32 @@ _tls13_openssl() {
     fi
 }
 
+# Проба с retry при DRP.
+_probe_tls12_retry() {
+    local target="$1"; shift
+    local cell
+    cell=$(_probe_tls12 "$target" "$TLS_FAST_S" "$@")
+    if [[ "$cell" == "DRP" ]]; then
+        cell=$(_probe_tls12 "$target" "$TLS_RETRY_S" "$@")
+    fi
+    echo "$cell"
+}
+
+_probe_tls13_retry() {
+    local target="$1"; shift
+    local cell
+    cell=$(_probe_tls13 "$target" "$TLS_FAST_S" "$@")
+    if [[ "$cell" == "DRP" ]]; then
+        cell=$(_probe_tls13 "$target" "$TLS_RETRY_S" "$@")
+    fi
+    echo "$cell"
+}
+
 # Рабочий поток проверки одной цели.
 # Формат результата: IP|HTTP|TLS12|TLS13|LAT|VERDICT|COLOR
 worker() {
     local target=$1 row=$2
-    local ip="" http="FAIL" t12="FAIL" t13="FAIL" lat="0ms" verdict="IP BLOCK" color="$C_RED"
+    local ip="" http="FAIL" t12="N/A" t13="N/A" lat="0ms" verdict="IP BLOCK" color="$C_RED"
 
     local curl_px=()
     if [[ "${PROXY_ENABLED}" == true ]] || [[ "${PROXY_ENABLED}" == "1" ]]; then
@@ -1042,7 +1371,7 @@ worker() {
     fi
 
     local http_out lat_raw rip http_ec
-    http_out=$(curl -s -m 2 "${curl_px[@]}" -I "http://$target" -A "curl/7.88.1" -w "\nREMOTE_IP=%{remote_ip}\nTIME_TOTAL=%{time_total}" 2>&1)
+    http_out=$(curl -s -m "$HTTP_TIMEOUT_S" "${curl_px[@]}" -I "http://$target" -A "curl/7.88.1" -w "\nREMOTE_IP=%{remote_ip}\nTIME_TOTAL=%{time_total}" 2>&1)
     http_ec=$?
     rip=$(printf '%s\n' "$http_out" | sed -n 's/^REMOTE_IP=//p' | tail -n 1 | tr -d '\r\n\t ')
     if [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
@@ -1063,94 +1392,84 @@ worker() {
             lat="---"
         fi
     else
-        if echo "$http_out" | grep -qi "timeout"; then http="DROP"; else http="ERR"; fi
+        if echo "$http_out" | grep -qi "timeout"; then http="DRP"; else http="FAIL"; fi
     fi
 
+    local aux="" vd_line vd_name vd_code
     if [[ "$TLS_MODE" == "TLS13" ]]; then
-        t12="---"
-        if $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
-            t13=$(_tls13_openssl "$target")
-        elif ! $CURL_HAS_TLS13; then
-            t13="N/A"
-        else
-            local t13_out ec13_s
-            t13_out=$(LC_ALL=C curl -k -sS -m 3 "${curl_px[@]}" -I "https://$target" --tlsv1.3 2>&1); ec13_s=$?
-            if [ $ec13_s -eq 0 ]; then t13="OK"
-            elif [ $ec13_s -eq 4 ] || echo "$t13_out" | grep -qiE "unsupported|not supported|unknown option|unrecognized option|built-in"; then t13="N/A"
-            elif echo "$t13_out" | grep -qi "reset"; then t13="RST"
-            else t13="DRP"
+        t12="N/A"
+        t13=$(_probe_tls13_retry "$target" "${curl_px[@]}")
+        if [[ "$http" == "OK" ]]; then
+            if [[ "$t13" == "OK" || "$t13" == "N/A" ]]; then
+                verdict="AVAILABLE"; color="$C_GRN"
+            elif [[ "$t13" == "RST" || "$t13" == "DRP" ]]; then
+                aux=$(_probe_tls12_retry "$target" "${curl_px[@]}")
+                vd_line=$(set_verdict_dual_tls "$aux" "$t13")
+                vd_name="${vd_line%%|*}"; vd_code="${vd_line##*|}"
+                verdict="$vd_name"; color=$(color_from_code "$vd_code")
+            else
+                verdict="DPI BLOCK"; color="$C_YEL"
             fi
         fi
     elif [[ "$TLS_MODE" == "TLS12" ]]; then
-        t13="---"
-        if ! $CURL_HAS_TLS_MAX; then
-            t12="N/A"
-        else
-            local t12_out
-            t12_out=$(curl -k -sS -m 3 "${curl_px[@]}" -I "https://$target" --tls-max 1.2 2>&1)
-            if [ $? -eq 0 ]; then t12="OK"
-            elif echo "$t12_out" | grep -qi "reset"; then t12="RST"
-            else t12="DRP"
+        t13="N/A"
+        t12=$(_probe_tls12_retry "$target" "${curl_px[@]}")
+        if [[ "$http" == "OK" ]]; then
+            if [[ "$t12" == "OK" ]]; then
+                verdict="AVAILABLE"; color="$C_GRN"
+            elif [[ "$t12" == "RST" || "$t12" == "DRP" ]]; then
+                aux=$(_probe_tls13_retry "$target" "${curl_px[@]}")
+                vd_line=$(set_verdict_dual_tls "$t12" "$aux")
+                vd_name="${vd_line%%|*}"; vd_code="${vd_line##*|}"
+                verdict="$vd_name"; color=$(color_from_code "$vd_code")
+            else
+                verdict="DPI BLOCK"; color="$C_YEL"
             fi
         fi
     else
-        # Auto: обе проверки TLS независимы — параллельно, чтобы не суммировать таймауты.
-        local t12_tmp="$TMP_DIR/w.${row}.12" t13_tmp="$TMP_DIR/w.${row}.13" t12_out t13_out ec12 ec13 pid12 pid13
+        # Auto: параллельные T12+T13, затем retry DRP по необходимости.
+        local t12_tmp="$TMP_DIR/w.${row}.12" t13_tmp="$TMP_DIR/w.${row}.13"
+        local ec12=2 ec13=2 pid12="" pid13=""
         if $CURL_HAS_TLS_MAX; then
-            curl -k -sS -m 3 "${curl_px[@]}" -I "https://$target" --tls-max 1.2 >"$t12_tmp" 2>&1 & pid12=$!
+            curl -k -sS -m "$TLS_FAST_S" "${curl_px[@]}" -I "https://$target" --tls-max 1.2 >"$t12_tmp" 2>&1 & pid12=$!
         else
             : >"$t12_tmp"
-            ec12=2
         fi
-        if $CURL_HAS_TLS13; then
-            LC_ALL=C curl -k -sS -m 3 "${curl_px[@]}" -I "https://$target" --tlsv1.3 >"$t13_tmp" 2>&1 & pid13=$!
+        if $CURL_HAS_TLS13 && ! { $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; }; then
+            LC_ALL=C curl -k -sS -m "$TLS_FAST_S" "${curl_px[@]}" -I "https://$target" --tlsv1.3 >"$t13_tmp" 2>&1 & pid13=$!
+        elif $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
+            _tls13_openssl "$target" "$TLS_FAST_S" >"$t13_tmp" 2>&1 & pid13=$!
         else
             : >"$t13_tmp"
-            ec13=2
         fi
 
-        if [[ -n "${pid12:-}" ]]; then wait "$pid12"; ec12=$?; fi
-        if [[ -n "${pid13:-}" ]]; then wait "$pid13"; ec13=$?; fi
-        t12_out=$(cat "$t12_tmp")
-        t13_out=$(cat "$t13_tmp")
-        rm -f "$t12_tmp" "$t13_tmp"
+        if [[ -n "$pid12" ]]; then wait "$pid12"; ec12=$?; fi
+        if [[ -n "$pid13" ]]; then wait "$pid13"; ec13=$?; fi
 
         if ! $CURL_HAS_TLS_MAX; then t12="N/A"
-        elif [ "$ec12" -eq 0 ]; then t12="OK"
-        elif echo "$t12_out" | grep -qi "reset"; then t12="RST"
-        else t12="DRP"
+        else t12=$(_tls_classify_curl "$ec12" "$(cat "$t12_tmp" 2>/dev/null)")
         fi
+
         if $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
-            t13=$(_tls13_openssl "$target")
+            t13=$(cat "$t13_tmp" 2>/dev/null | tr -d '\r\n')
+            [[ -z "$t13" ]] && t13="DRP"
         elif ! $CURL_HAS_TLS13; then t13="N/A"
-        elif [ "$ec13" -eq 0 ]; then t13="OK"
-        elif [ "$ec13" -eq 4 ] || echo "$t13_out" | grep -qiE "unsupported|not supported|unknown option|unrecognized option|built-in"; then t13="N/A"
-        elif echo "$t13_out" | grep -qi "reset"; then t13="RST"
-        else t13="DRP"
+        else t13=$(_tls_classify_curl "$ec13" "$(cat "$t13_tmp" 2>/dev/null)")
+        fi
+        rm -f "$t12_tmp" "$t13_tmp"
+
+        [[ "$t12" == "DRP" ]] && t12=$(_probe_tls12 "$target" "$TLS_RETRY_S" "${curl_px[@]}")
+        [[ "$t13" == "DRP" ]] && t13=$(_probe_tls13 "$target" "$TLS_RETRY_S" "${curl_px[@]}")
+
+        if [[ "$http" == "OK" ]]; then
+            vd_line=$(set_verdict_dual_tls "$t12" "$t13")
+            vd_name="${vd_line%%|*}"; vd_code="${vd_line##*|}"
+            verdict="$vd_name"; color=$(color_from_code "$vd_code")
         fi
     fi
 
-    if [ "$http" == "OK" ]; then
-        if [[ "$TLS_MODE" == "TLS12" ]]; then
-            if [ "$t12" == "OK" ]; then verdict="AVAILABLE"; color="$C_GRN"
-            elif [ "$t12" == "RST" ] || [ "$t12" == "DRP" ]; then verdict="DPI BLOCK"; color="$C_YEL"
-            else verdict="DPI BLOCK"; color="$C_YEL"; fi
-        elif [[ "$TLS_MODE" == "TLS13" ]]; then
-            if [ "$t13" == "OK" ]; then verdict="AVAILABLE"; color="$C_GRN"
-            elif [ "$t13" == "N/A" ]; then verdict="AVAILABLE"; color="$C_GRN"
-            elif [ "$t13" == "RST" ] || [ "$t13" == "DRP" ]; then verdict="DPI BLOCK"; color="$C_YEL"
-            else verdict="DPI BLOCK"; color="$C_YEL"; fi
-        else
-            if [ "$t12" == "OK" ] && [ "$t13" == "OK" ]; then verdict="AVAILABLE"; color="$C_GRN"
-            elif [ "$t12" == "OK" ] && [ "$t13" == "N/A" ]; then verdict="AVAILABLE"; color="$C_GRN"
-            elif [ "$t12" == "N/A" ] && [ "$t13" == "OK" ]; then verdict="AVAILABLE"; color="$C_GRN"
-            elif [ "$t12" == "OK" ] && { [ "$t13" == "RST" ] || [ "$t13" == "DRP" ]; }; then verdict="THROTTLED"; color="$C_YEL"
-            elif [ "$t13" == "OK" ] && { [ "$t12" == "RST" ] || [ "$t12" == "DRP" ]; }; then verdict="THROTTLED"; color="$C_YEL"
-            else verdict="DPI BLOCK"; color="$C_YEL"; fi
-        fi
-    else
-        # HTTP не OK -> смотрим RST ошибки
-        if { [ "$t12" == "RST" ] || [ "$t13" == "RST" ]; } && [ "$http" == "ERR" ]; then
+    if [[ "$http" != "OK" ]]; then
+        if { [ "$t12" == "RST" ] || [ "$t13" == "RST" ]; } && [ "$http" == "FAIL" ]; then
             verdict="ROUTING ERROR"; color="$C_RED"
         else
             verdict="IP BLOCK"; color="$C_RED"
@@ -1163,10 +1482,58 @@ worker() {
 ui_state_sig() {
     local tg
     tg=$(printf '%s|' "${TARGETS[@]}")
-    printf '%s' "${DNS}|${CDN}|${ISP}|${LOC}|${PROXY_ENABLED}|${PROXY_TYPE}|${PROXY_HOST}|${PROXY_PORT}|${IP_PREFERENCE}|${TLS_MODE}|${HAS_IPV6}|${tg}"
+    printf '%s' "${DNS}|${CDN}|${ISP}|${LOC}|${PROXY_ENABLED}|${PROXY_TYPE}|${PROXY_HOST}|${PROXY_PORT}|${IP_PREFERENCE}|${TLS_MODE}|${HAS_IPV6}|${USE_CUSTOM_TARGETS}|${tg}"
 }
 
+# Сводка вердиктов после скана (аналог Get-IdleStatusMessage).
+get_scan_summary() {
+    local available=0 throttled=0 dpi=0 ipblock=0 total=0
+    local i row verdict
+    for i in "${!TARGETS[@]}"; do
+        row=$((12 + i))
+        [[ -f "$TMP_DIR/$row.res" ]] || continue
+        IFS='|' read -r _ _ _ _ _ verdict _ < "$TMP_DIR/$row.res"
+        ((total++))
+        case "$verdict" in
+            AVAILABLE) ((available++)) ;;
+            THROTTLED) ((throttled++)) ;;
+            "DPI RESET"|"DPI BLOCK") ((dpi++)) ;;
+            "IP BLOCK") ((ipblock++)) ;;
+        esac
+    done
+    if (( total < 1 )); then
+        echo "STATUS: ГОТОВ"
+        return
+    fi
+    if (( available == total )); then
+        echo "SCAN RESULT: OK | $available HOSTS AVAILABLE"
+        return
+    fi
+    local joined=""
+    local p
+    for p in "${parts[@]}"; do
+        if [[ -z "$joined" ]]; then joined="$p"; else joined="$joined | $p"; fi
+    done
+    echo "SCAN RESULT: DPI DETECTED | $joined"
+}
+
+draw_nav_idle() {
+    UI_Y=$((12 + ${#TARGETS[@]} + 1))
+    UI_Y2=$((UI_Y + 1))
+    local summary="${LAST_SCAN_SUMMARY:-STATUS: ГОТОВ}"
+    local scol="$C_GRN"
+    [[ "$summary" == *"DPI DETECTED"* ]] && scol="$C_YEL"
+    out_str 2 $UI_Y 121 "$summary" "$scol"
+    out_str 2 $UI_Y2 121 "$NAV_STR" "$C_WHT"
+    flush_buffer
+}
+
+if $_YT_DPI_LIB_ONLY; then
+    return 0 2>/dev/null || exit 0
+fi
+
 config_load
+debug_log_session_header_if_needed
 
 FIRST_RUN=true
 
@@ -1175,31 +1542,29 @@ while true; do
         get_network_info
         rebuild_targets
         draw_ui
-        UI_Y=$((12 + ${#TARGETS[@]} + 1))
-        out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer
+        draw_nav_idle
         FIRST_RUN=false
     fi
 
     read -t $READ_TIMEOUT -n 1 -s key
     READ_STATUS=$?
-    # bash 3.2 does not clear the variable on timeout — stale key would re-fire hotkeys
     [[ $READ_STATUS -ne 0 ]] && key=""
 
-    # Горячие клавиши: EN и те же физические клавиши под RU (ЙЦУКЕН).
     if [[ "$key" == "q" || "$key" == "Q" || "$key" == "й" || "$key" == "Й" || "$key" == $'\e' ]]; then break
-    elif [[ "$key" == "h" || "$key" == "H" || "$key" == "р" || "$key" == "Р" ]]; then show_help; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
-    elif [[ "$key" == "s" || "$key" == "S" || "$key" == "ы" || "$key" == "Ы" ]]; then show_settings_menu; get_network_info; rebuild_targets; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
-    elif [[ "$key" == "p" || "$key" == "P" || "$key" == "з" || "$key" == "З" ]]; then show_proxy_menu; get_network_info; rebuild_targets; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
-    elif [[ "$key" == "t" || "$key" == "T" || "$key" == "е" || "$key" == "Е" ]]; then test_proxy; draw_ui; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
+    elif [[ "$key" == "h" || "$key" == "H" || "$key" == "р" || "$key" == "Р" ]]; then show_help; draw_ui; draw_nav_idle; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
+    elif [[ "$key" == "s" || "$key" == "S" || "$key" == "ы" || "$key" == "Ы" ]]; then show_settings_menu; get_network_info; rebuild_targets; draw_ui; draw_nav_idle; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
+    elif [[ "$key" == "p" || "$key" == "P" || "$key" == "з" || "$key" == "З" ]]; then show_proxy_menu; get_network_info; rebuild_targets; draw_ui; draw_nav_idle; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
+    elif [[ "$key" == "t" || "$key" == "T" || "$key" == "е" || "$key" == "Е" ]]; then test_proxy; draw_ui; draw_nav_idle; while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done
     elif [[ "$key" == "r" || "$key" == "R" || "$key" == "к" || "$key" == "К" ]]; then
         out_str 2 $UI_Y 121 "[ WAIT ] SAVING REPORT..." "$C_CYA"; flush_buffer
-        LOG="YT-DPI_Report.txt"
+        LOG="$SCRIPT_DIR/YT-DPI_Report.txt"
         {
             echo "=== YT-DPI REPORT v${SCRIPT_VERSION} ==="
             echo "TIME: $(date '+%Y-%m-%d %H:%M:%S')"
             echo "ISP:  $ISP ($LOC)"
             echo "DNS:  $DNS"
             echo "IpPreference: $IP_PREFERENCE  TlsMode: $TLS_MODE"
+            echo "UseCustomTargets: $USE_CUSTOM_TARGETS"
             if [[ "${PROXY_ENABLED}" == true ]] || [[ "${PROXY_ENABLED}" == "1" ]]; then echo "PROXY: $PROXY_TYPE $PROXY_HOST:$PROXY_PORT"; else echo "PROXY: [ OFF ]"; fi
             echo "------------------------------------------------------------------------------------------"
             printf "%-38s %-16s %-6s %-8s %-8s %-6s %s\n" "TARGET DOMAIN" "IP ADDRESS" "HTTP" "TLS 1.2" "TLS 1.3" "LAT" "RESULT"
@@ -1213,8 +1578,8 @@ while true; do
                 fi
             done
         } > "$LOG"
-        out_str 2 $UI_Y 121 "[ SUCCESS ] SAVED: $(pwd)/$LOG" "$C_GRN"; flush_buffer
-        sleep 2; out_str 2 $UI_Y 121 "$NAV_STR" "$C_WHT"; flush_buffer
+        out_str 2 $UI_Y 121 "[ SUCCESS ] SAVED: $LOG" "$C_GRN"; flush_buffer
+        sleep 2; draw_nav_idle
 
     elif [[ "$key" == $'\n' || "$key" == $'\r' ]] || [[ $READ_STATUS -eq 0 && -z "$key" ]]; then
         old_sig=""
@@ -1228,14 +1593,21 @@ while true; do
         if [[ "$new_sig" != "$old_sig" ]]; then
             draw_ui
             UI_Y=$((12 + ${#TARGETS[@]} + 1))
+            UI_Y2=$((UI_Y + 1))
         fi
-        out_str 2 $UI_Y 121 "$NAV_SCAN" "$C_YEL"; flush_buffer
+        out_str 2 $UI_Y 121 "$NAV_SCAN" "$C_YEL"
+        out_str 2 $UI_Y2 121 " " "$C_WHT"
+        flush_buffer
 
         rm -f "$TMP_DIR"/*.res
         JOB_STATE=()
         ACTIVE_JOBS=${#TARGETS[@]}
+        total_jobs=$ACTIVE_JOBS
+        done_jobs=0
 
         export PROXY_ENABLED PROXY_TYPE PROXY_STR IP_PREFERENCE TLS_MODE HAS_IPV6 OS_MAC
+        export CURL_HAS_TLS13 CURL_HAS_TLS_MAX CURL_HAS_SOCKS5H HTTP_TIMEOUT_S TLS_FAST_S TLS_RETRY_S
+        export TMP_DIR CURL_BIN
 
         running_jobs=0
         for i in "${!TARGETS[@]}"; do
@@ -1269,11 +1641,12 @@ while true; do
                     out_str $X_IP   $row $W_IP "$ip" "$C_GRY"
                     [ "$http" == "OK" ] && hcol="$C_GRN" || hcol="$C_RED"
                     out_str $X_HTTP $row $W_HTTP "$http" "$hcol"
-                    [ "$t12" == "OK" ] && t12col="$C_GRN" || t12col="$C_RED"
-                    [[ "$t12" == "---" ]] && t12col="$C_GRY"
+                    if [ "$t12" == "OK" ]; then t12col="$C_GRN"
+                    elif [ "$t12" == "N/A" ]; then t12col="$C_GRY"
+                    else t12col="$C_RED"; fi
                     out_str $X_T12  $row $W_T12 "$t12" "$t12col"
                     if [ "$t13" == "OK" ]; then t13col="$C_GRN"
-                    elif [ "$t13" == "N/A" ] || [ "$t13" == "---" ]; then t13col="$C_GRY"
+                    elif [ "$t13" == "N/A" ]; then t13col="$C_GRY"
                     else t13col="$C_RED"; fi
                     out_str $X_T13  $row $W_T13 "$t13" "$t13col"
                     out_str $X_LAT  $row $W_LAT "$lat" "$C_CYA"
@@ -1281,16 +1654,26 @@ while true; do
 
                     JOB_STATE[$i]=0
                     ((ACTIVE_JOBS--))
+                    ((done_jobs++))
                 fi
             done
+            out_str 2 $UI_Y2 40 "[ $done_jobs / $total_jobs ]" "$C_CYA"
             if [[ -n "$FRAME_BUFFER" ]]; then flush_buffer; fi
         done
 
         if $aborted; then
             kill $(jobs -p) 2>/dev/null
+            LAST_SCAN_SUMMARY="[ ABORTED ] SCAN STOPPED"
             out_str 2 $UI_Y 121 "$NAV_ABORT" "$C_RED"
+            out_str 2 $UI_Y2 121 " " "$C_WHT"
         else
-            out_str 2 $UI_Y 121 "$NAV_DONE" "$C_GRN"
+            HAS_COMPLETED_SCAN=true
+            LAST_SCAN_SUMMARY=$(get_scan_summary)
+            scol="$C_GRN"
+            [[ "$LAST_SCAN_SUMMARY" == *"DPI DETECTED"* ]] && scol="$C_YEL"
+            out_str 2 $UI_Y 121 "$LAST_SCAN_SUMMARY" "$scol"
+            out_str 2 $UI_Y2 121 "$NAV_DONE" "$C_GRN"
+            debug_log "Скан завершён: $LAST_SCAN_SUMMARY" "INFO"
         fi
         flush_buffer
         while read -t "$DRAIN_READ_TIMEOUT" -n 1 -s; do : ; done

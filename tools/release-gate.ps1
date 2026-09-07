@@ -150,11 +150,9 @@ function Get-YtDpiHereStringContent {
 }
 
 function Assert-YtDpiSnippetSanity {
-    param([string]$TlsCode, [string]$TraceCode)
+    param([string]$TlsCode)
     if ([string]::IsNullOrWhiteSpace($TlsCode)) { throw 'Extracted TLS snippet is empty.' }
-    if ([string]::IsNullOrWhiteSpace($TraceCode)) { throw 'Extracted traceroute snippet is empty.' }
     if ($TlsCode -notmatch '(?m)\bclass\s+TlsScanner\b') { throw 'TLS snippet sanity: missing type TlsScanner.' }
-    if ($TraceCode -notmatch '(?m)\bclass\s+AdvancedTraceroute\b') { throw 'Trace snippet sanity: missing type AdvancedTraceroute.' }
 }
 
 function Get-PwshCandidatePaths {
@@ -215,10 +213,10 @@ function Invoke-GateHost {
         [string]$Exe,
         [string]$Label,
         [string]$TlsFile,
-        [string]$TraceFile,
         [string]$Helper,
         [string]$RepoRootArg,
-        [string]$LogDir
+        [string]$LogDir,
+        [string]$TraceFile = $null
     )
     Write-GateMsg "---- $Label ----"
     $slugRaw = ($Label -replace '[<>:"/\\|?*\[\]]', '_' -replace '\s+', '_')
@@ -229,8 +227,11 @@ function Invoke-GateHost {
     $errLog = Join-Path $LogDir ("gate_{0}_stderr.txt" -f $slug)
     $hostArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Helper,
-        '-TlsPath', $TlsFile, '-TracePath', $TraceFile
+        '-TlsPath', $TlsFile
     )
+    if ($TraceFile) {
+        $hostArgs += @('-TracePath', $TraceFile)
+    }
     if ($RepoRootArg) {
         $hostArgs += @('-RepoRoot', $RepoRootArg)
     }
@@ -283,16 +284,15 @@ Test-YtDpiAstOrThrow -Path $ytDpi
 $lines = Get-Content -LiteralPath $ytDpi
 try {
     $tlsCode = Get-YtDpiHereStringContent -Lines $lines -StartPattern '^\s*\$tlsCode\s*=\s*@"\s*$'
-    $traceCode = Get-YtDpiHereStringContent -Lines $lines -StartPattern '^\s*\$traceCode\s*=\s*@"\s*$'
-    Write-GateStep -Status PASS -Phase 'extract embedded C# here-strings'
+    Write-GateStep -Status PASS -Phase 'extract embedded C# here-strings' -Detail 'TlsScanner only (Deep Trace removed)'
 } catch {
     Write-GateStep -Status FAIL -Phase 'extract embedded C# here-strings' -Detail "$_"
     throw
 }
 
 try {
-    Assert-YtDpiSnippetSanity -TlsCode $tlsCode -TraceCode $traceCode
-    Write-GateStep -Status PASS -Phase 'snippet sanity (TlsScanner / AdvancedTraceroute)'
+    Assert-YtDpiSnippetSanity -TlsCode $tlsCode
+    Write-GateStep -Status PASS -Phase 'snippet sanity (TlsScanner)'
 } catch {
     Write-GateStep -Status FAIL -Phase 'snippet sanity' -Detail "$_"
     throw
@@ -303,10 +303,8 @@ $null = New-Item -ItemType Directory -Path $dir -Force
 $gateSucceeded = $false
 try {
     $tlsFile = Join-Path $dir 'tls_gate.cs.txt'
-    $traceFile = Join-Path $dir 'trace_gate.cs.txt'
     $utf8 = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($tlsFile, $tlsCode, $utf8)
-    [System.IO.File]::WriteAllText($traceFile, $traceCode, $utf8)
     Write-GateStep -Status PASS -Phase 'write temp snippet files' -Detail $dir
 
     $helper = Join-Path $PSScriptRoot 'release-gate-addtype.ps1'
@@ -334,7 +332,6 @@ try {
     Write-GateMsg '---- Add-Type + smoke (current session) ----'
     $addArgs = @{
         TlsPath   = $tlsFile
-        TracePath = $traceFile
         RepoRoot  = $RepoRoot
         SkipSmoke = $false
     }
@@ -348,7 +345,6 @@ try {
     } catch {
         Write-GateStep -Status FAIL -Phase 'release-gate-addtype (orchestrator session)' -Detail "$_"
         Write-Host ('[FAIL] TlsPath={0}' -f $tlsFile) -ForegroundColor Red
-        Write-Host ('[FAIL] TracePath={0}' -f $traceFile) -ForegroundColor Red
         throw
     }
 
@@ -356,7 +352,7 @@ try {
         $winPs = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
         if (Test-Path -LiteralPath $winPs) {
             Invoke-GateHost -Exe $winPs -Label 'Windows PowerShell 5.1 x64 (System32)' `
-                -TlsFile $tlsFile -TraceFile $traceFile -Helper $helper -RepoRootArg $RepoRoot -LogDir $dir
+                -TlsFile $tlsFile -Helper $helper -RepoRootArg $RepoRoot -LogDir $dir
         } else {
             Write-Warning 'powershell.exe not found under System32; skipped.'
             Write-GateStep -Status SKIP -Phase 'Windows PowerShell 5.1 x64' -Detail 'powershell.exe missing under System32'
@@ -366,7 +362,7 @@ try {
             $wowPs = Join-Path $env:WINDIR 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
             if (Test-Path -LiteralPath $wowPs) {
                 Invoke-GateHost -Exe $wowPs -Label 'Windows PowerShell 5.1 WOW64 (32-bit)' `
-                    -TlsFile $tlsFile -TraceFile $traceFile -Helper $helper -RepoRootArg $RepoRoot -LogDir $dir
+                    -TlsFile $tlsFile -Helper $helper -RepoRootArg $RepoRoot -LogDir $dir
             } else {
                 Write-GateMsg '---- WOW64 powershell.exe not present (e.g. ARM64 host); skip ----'
                 Write-GateStep -Status SKIP -Phase 'Windows PowerShell 5.1 WOW64' -Detail 'exe not present'
@@ -389,7 +385,7 @@ try {
             foreach ($exe in $pwshList) {
                 $n++
                 Invoke-GateHost -Exe $exe -Label ("pwsh candidate {0} / {1}: {2}" -f $n, $pwshList.Count, $exe) `
-                    -TlsFile $tlsFile -TraceFile $traceFile -Helper $helper -RepoRootArg $RepoRoot -LogDir $dir
+                    -TlsFile $tlsFile -Helper $helper -RepoRootArg $RepoRoot -LogDir $dir
             }
         }
     } else {
