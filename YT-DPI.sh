@@ -59,6 +59,9 @@ fi
 
 OS_MAC=false
 if [[ "$OSTYPE" == "darwin"* ]]; then OS_MAC=true; fi
+# Git Bash / MSYS (часто curl+Schannel с ломаным --tlsv1.3).
+OS_MSYS=false
+if [[ -n "${MSYSTEM:-}" ]] || [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]]; then OS_MSYS=true; fi
 
 SCRIPT_VERSION="2.3.3"
 # Каталог скрипта (targets.txt / debug log рядом с файлом).
@@ -129,6 +132,10 @@ CURL_BIN=""
 CURL_HAS_TLS13=false
 CURL_HAS_TLS_MAX=false
 CURL_HAS_SOCKS5H=false
+CURL_USES_SCHANNEL=false
+HAS_OPENSSL=false
+# TLS1.3 через openssl (macOS / Schannel), а не через curl --tlsv1.3.
+TLS13_VIA_OPENSSL=false
 
 if ! $_YT_DPI_LIB_ONLY; then
     _required_cmds="curl awk"
@@ -153,6 +160,19 @@ if ! $_YT_DPI_LIB_ONLY; then
     curl_supports_opt "--tlsv1.3" && CURL_HAS_TLS13=true
     curl_supports_opt "--tls-max" && CURL_HAS_TLS_MAX=true
     curl_supports_opt "socks5h://" && CURL_HAS_SOCKS5H=true
+
+    if curl --version 2>/dev/null | head -n 1 | grep -qi "Schannel"; then
+        CURL_USES_SCHANNEL=true
+    fi
+    if command -v openssl &>/dev/null; then HAS_OPENSSL=true; fi
+
+    # Schannel advertises --tlsv1.3 but often fails with SEC_E_ALGORITHM_MISMATCH → false THROTTLED.
+    if $HAS_OPENSSL && { $OS_MAC || $CURL_USES_SCHANNEL || $OS_MSYS; }; then
+        TLS13_VIA_OPENSSL=true
+    elif $CURL_USES_SCHANNEL; then
+        # Нет openssl — не делаем ложный DRP по curl --tlsv1.3.
+        CURL_HAS_TLS13=false
+    fi
 
     if ! TMP_DIR=$(mktemp -d); then
         echo "Error: mktemp failed (cannot create temp dir)." >&2
@@ -844,9 +864,9 @@ draw_ui() {
     out_str 45 1 0 '██████╗    ██████╗ ' "$C_GRY"
     out_str 45 2 0 '╚════██╗   ╚════██╗' "$C_GRY"
     out_str 45 3 0 ' █████╔╝    █████╔╝' "$C_GRY"
-    out_str 45 4 0 '██╔═══╝    ██╔═══╝' "$C_GRY"
-    out_str 45 5 0 '███████╗██╗███████╗' "$C_GRY"
-    out_str 45 6 0 '╚══════╝╚═╝╚══════╝' "$C_GRY"
+    out_str 45 4 0 '██╔═══╝     ╚═══██╗' "$C_GRY"
+    out_str 45 5 0 '███████╗██╗██████╔╝' "$C_GRY"
+    out_str 45 6 0 '╚══════╝╚═╝╚═════╝' "$C_GRY"
 
     out_str 65 1 0 "> SYS STATUS: [ ONLINE ]" "$C_GRN"
     out_str 65 2 50 "> ENGINE: Barebuh Pro v2.3.7" "$C_RED"
@@ -1293,8 +1313,19 @@ _tls_classify_curl() {
     if [ "$ec" -eq 4 ] || echo "$out" | grep -qiE "unsupported|not supported|unknown option|unrecognized option|built-in"; then
         echo "N/A"; return
     fi
+    # Git Bash Schannel: --tlsv1.3 advertised but AcquireCredentialsHandle fails.
+    if echo "$out" | grep -qiE "SEC_E_ALGORITHM_MISMATCH|AcquireCredentialsHandle|schannel:.*failed"; then
+        echo "N/A"; return
+    fi
     if echo "$out" | grep -qi "reset"; then echo "RST"; return; fi
     echo "DRP"
+}
+
+# openssl TLS1.3 без прокси (s_client не ходит через curl -x).
+_tls13_should_use_openssl() {
+    if ! $TLS13_VIA_OPENSSL; then return 1; fi
+    if [[ "${PROXY_ENABLED}" == true ]] || [[ "${PROXY_ENABLED}" == "1" ]]; then return 1; fi
+    return 0
 }
 
 # Проба TLS 1.2 (curl --tls-max 1.2). $1=target $2=timeout_s; curl_px через глобальный контекст worker.
@@ -1310,26 +1341,31 @@ _probe_tls12() {
 _probe_tls13() {
     local target="$1" to="$2"
     local -a px=("${@:3}")
-    if $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
+    if _tls13_should_use_openssl; then
         _tls13_openssl "$target" "$to"
         return
     fi
+    # Schannel: curl --tlsv1.3 даёт SEC_E_ALGORITHM_MISMATCH — не маскируем под DRP/THROTTLED.
+    if $CURL_USES_SCHANNEL; then echo "N/A"; return; fi
     if ! $CURL_HAS_TLS13; then echo "N/A"; return; fi
     local out ec
     out=$(LC_ALL=C curl -k -sS -m "$to" "${px[@]}" -I "https://$target" --tlsv1.3 2>&1); ec=$?
     _tls_classify_curl "$ec" "$out"
 }
 
-# TLS 1.3 через openssl s_client (fallback для macOS).
+# TLS 1.3 через openssl s_client (macOS / Git Bash Schannel — реальный handshake, не заглушка).
 _tls13_openssl() {
     local target="$1" to="${2:-$TLS_FAST_S}"
     local out
+    if ! command -v openssl &>/dev/null; then echo "N/A"; return; fi
     out=$(echo Q | _run_timeout "$to" openssl s_client -tls1_3 \
         -connect "${target}:443" -servername "$target" 2>&1)
-    if echo "$out" | grep -q "Protocol  : TLSv1.3"; then
+    if echo "$out" | grep -qiE 'Protocol[[:space:]]*:[[:space:]]*TLSv1\.3|[[:space:]]New,[[:space:]]*TLSv1\.3'; then
         echo "OK"
-    elif echo "$out" | grep -qiE "reset|RST"; then
+    elif echo "$out" | grep -qiE "reset|RST|connection reset"; then
         echo "RST"
+    elif echo "$out" | grep -qiE "wrong version number|unsupported protocol|no protocols available|tlsv1alert"; then
+        echo "N/A"
     else
         echo "DRP"
     fi
@@ -1435,10 +1471,12 @@ worker() {
         else
             : >"$t12_tmp"
         fi
-        if $CURL_HAS_TLS13 && ! { $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; }; then
-            LC_ALL=C curl -k -sS -m "$TLS_FAST_S" "${curl_px[@]}" -I "https://$target" --tlsv1.3 >"$t13_tmp" 2>&1 & pid13=$!
-        elif $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
+        if _tls13_should_use_openssl; then
             _tls13_openssl "$target" "$TLS_FAST_S" >"$t13_tmp" 2>&1 & pid13=$!
+        elif $CURL_USES_SCHANNEL; then
+            printf 'N/A' >"$t13_tmp"
+        elif $CURL_HAS_TLS13; then
+            LC_ALL=C curl -k -sS -m "$TLS_FAST_S" "${curl_px[@]}" -I "https://$target" --tlsv1.3 >"$t13_tmp" 2>&1 & pid13=$!
         else
             : >"$t13_tmp"
         fi
@@ -1450,9 +1488,11 @@ worker() {
         else t12=$(_tls_classify_curl "$ec12" "$(cat "$t12_tmp" 2>/dev/null)")
         fi
 
-        if $OS_MAC && [[ "${PROXY_ENABLED}" != true ]] && [[ "${PROXY_ENABLED}" != "1" ]]; then
+        if _tls13_should_use_openssl; then
             t13=$(cat "$t13_tmp" 2>/dev/null | tr -d '\r\n')
             [[ -z "$t13" ]] && t13="DRP"
+        elif $CURL_USES_SCHANNEL; then
+            t13="N/A"
         elif ! $CURL_HAS_TLS13; then t13="N/A"
         else t13=$(_tls_classify_curl "$ec13" "$(cat "$t13_tmp" 2>/dev/null)")
         fi
@@ -1605,8 +1645,9 @@ while true; do
         total_jobs=$ACTIVE_JOBS
         done_jobs=0
 
-        export PROXY_ENABLED PROXY_TYPE PROXY_STR IP_PREFERENCE TLS_MODE HAS_IPV6 OS_MAC
+        export PROXY_ENABLED PROXY_TYPE PROXY_STR IP_PREFERENCE TLS_MODE HAS_IPV6 OS_MAC OS_MSYS
         export CURL_HAS_TLS13 CURL_HAS_TLS_MAX CURL_HAS_SOCKS5H HTTP_TIMEOUT_S TLS_FAST_S TLS_RETRY_S
+        export CURL_USES_SCHANNEL HAS_OPENSSL TLS13_VIA_OPENSSL
         export TMP_DIR CURL_BIN
 
         running_jobs=0
