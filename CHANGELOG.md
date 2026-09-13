@@ -1,3 +1,74 @@
+# YT-DPI v3.0.1 (Windows: `YT-DPI.bat` + `YT-DPI.ps1`)
+
+**Релизный комплект:** Windows **3.0.1** · Unix **`YT-DPI.sh` 2.3.3** (**без изменений** в этом релизе).
+
+**Базис:** hotfix поверх **`3.0` → `3.0.1`**. Windows TUI / lifecycle скана / PATH + производительность пула. Новых EXTRA-проб и CLI-флагов нет.
+
+**Движок в баннере:** **Barebuh Pro v3.2 / TUI v1.5.3**.
+
+**Кратко для пользователя:** заметно прокачанный **TUI** — viewport при длинном `targets.txt`, плавная прокрутка **без лагов и мерцания**, скролл сразу после скана (EXTRA в фоне), быстрее collect за счёт shared RunspacePool и WaitAny.
+
+---
+
+## Исправлено (Windows)
+
+### TUI / окно (большие списки без лагов)
+
+* **Viewport таблицы** при большом `targets.txt`: NAV + STATUS закреплены внизу окна, больше не наезжают на строки; рисуются только **видимые** строки.
+* **Прокрутка:** `↑↓` / `PgUp` / `PgDn` / `Home` / `End` (в idle, во время скана и **сразу после** Enter).
+* Лёгкая перерисовка при скролле — только ячейки видимых строк + полоска `N–M/Total` (без мигания всего экрана).
+* Скролл: coalesce очереди стрелок → **одна** перерисовка; без `Add-Member` / `Get-UiLayout` на каждую ячейку; poll 20 ms; Force-resize не перед scroll.
+* **Лаг скролла убран:** сдвиг ±N в пределах viewport — delta-paint только новых строк (было ~150–300 ms / ~241 `Out-Str` на шаг).
+* **Мерцание строк при скролле убрано:** вместо `MoveBufferArea` + поклеточного `Out-Str` — сдвиг `BufferCell[,]` в памяти и один `SetBufferContents` на тело таблицы (`outStr` на шаг ≈ 1 — полоска `N–M/Total`).
+* Debounce ресайза / min-max; при смене размера — Clear + полный redraw; стирание «хвостов» STATUS при смене ширины.
+* `Out-Str` обрезает строки по `WindowWidth` (меньше дыр от исключений консоли).
+* `Update-ConsoleSize` больше не раздувает окно под все цели и не борется с ручным ресайзом после старта.
+
+### Скан / STATUS
+
+* **Abort (Esc/Q):** не затирает хороший прошлый результат partial/`null`; без истории — `SCAN ABORTED` вместо залипания **IDLE**.
+* `ScanPhase` (`Idle` / `Running` / `Finishing`) — защита от двойного Enter.
+* Убраны искусственные паузы после скана (2s / cosmetic sleeps); повторный Enter доступен сразу после таблицы.
+* Bypass **WARN** — только **один раз при старте сессии**, не после каждого скана.
+* Убран tip `[ ПОДСКАЗКА ]` из STATUS после extras; рекомендации — в **`[E]`**.
+* Post-scan EXTRA (DNS/QUIC/TCP16/SNI) — **in-process async** runspace; main loop только поллит completion (скролл сразу после скана, без блокировки на длинных пробах).
+* **Shared RunspacePool** между Enter-сканами (Create/Dispose не на каждый скан); при abort — `Stop` неполных воркеров.
+* Collect-фаза: **`WaitHandle.WaitAny`/`WaitOne`** с таймаутом AnimFps (chunk ≤63 при >64 handles) вместо sleep + полный foreach каждый кадр.
+* **Водопад reveal:** paint + sleep только для **видимых** строк viewport (длинный `targets.txt` без паузы на хвост).
+* Placeholder / abort-repaint — только видимое окно (`Get-TableViewportIndexRange`).
+* Post-scan NetInfo при протухшем кэше — **фон** (`Start-BackgroundNetInfoUpdate`), без блокирующего `[ NET ]`.
+
+### Производительность TUI
+
+* Прямой вызов `Format-TlsCellDisplay` / `Get-MainTableResults` (без `Get-Command` на каждую ячейку).
+* `Out-Str`: `CursorVisible` гасится один раз за серию (`UiCursorHidden`), не на каждый символ.
+* `Get-IdleStatusMessage`: один проход по вердиктам вместо 7× `Where-Object`.
+* Убран дубль отрисовки разделителя заголовка таблицы.
+* Delta-scroll (`Update-TableViewportCellsDelta`): `GetBufferContents` / `SetBufferContents`; полный кадр только при `|delta| ≥ visibleRows` (Home/End / крупные Pg*).
+
+### PATH `[G]`
+
+* Отказ при **включённом прокси** (ICMP не идёт через HTTP/SOCKS).
+* Отказ / пояснение при похожем **VPN**-адаптере.
+* Если трасса «схлопнулась» (1 hop / ~0 ms до цели) — экран недоступности вместо вводящей в заблуждение таблицы.
+
+### Прочее
+
+* Тексты EXTRA / recommendations / bypass-banner — **на русском**.
+* Баннер: **Barebuh Pro v3.2 / TUI v1.5.3**.
+* `$scriptVersion = "3.0.1"`; `YT-DPI.bat` title v3.0.1.
+* Smoke: `scriptVersion` принимает `3.0.x`; символы `Ensure-ScanRunspacePool` / `Update-ExtrasFromCompletedAsync`.
+
+## Bash
+
+Без изменений (**2.3.3**).
+
+## Миграция с Windows 3.0
+
+Замените `YT-DPI.bat` + `YT-DPI.ps1` (тег **3.0.1**) или обновитесь через **`[U]`** (апдейтер тянет и `.ps1`, и companion `.bat`). Конфиг совместим.
+
+---
+
 # YT-DPI v3.0 (Windows: `YT-DPI.bat` + `YT-DPI.ps1`)
 
 **Релизный комплект:** Windows **3.0** · Unix **`YT-DPI.sh` 2.3.3** (в этом релизе `.sh` не менялся; паритет с Windows 2.3.3 уже в `.sh`).
