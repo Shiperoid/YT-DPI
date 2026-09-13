@@ -26,7 +26,7 @@ for ($__i = 0; $__i -lt $script:CliArgs.Count; $__i++) {
         }
         '^--report=(.+)$' { $script:TxtReportPath = $Matches[1]; continue }
         '^--help$|^-h$' {
-            Write-Host "YT-DPI 3.0 — usage:"
+            Write-Host "YT-DPI 3.0.1 — usage:"
             Write-Host "  YT-DPI.bat [--batch] [--no-extras] [--json path] [--report path]"
             Write-Host "  --batch       headless suite (scan + extras), write reports, exit 0/1/2"
             Write-Host "  --no-extras   domain scan only (skip QUIC/DNS/TCP16/IpVsSni)"
@@ -68,7 +68,7 @@ if ($script:AllowInsecureTls) {
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 100
 
-$scriptVersion = "3.0"   # YT-DPI 3.0 (Windows)
+$scriptVersion = "3.0.1"   # YT-DPI 3.0.1 (Windows)
 # ===== ОТЛАДКА =====
 $debugEnvRaw = [System.Environment]::GetEnvironmentVariable("YT_DPI_DEBUG", "Process")
 if (-not $debugEnvRaw) { $debugEnvRaw = [System.Environment]::GetEnvironmentVariable("YT_DPI_DEBUG", "User") }
@@ -128,6 +128,7 @@ $SCRIPT:CONST = @{
         StatusBarThrottleCollectMs = 90   # Снижено с 240
         StatusBarThrottleRevealMs  = 110  # Снижено с 280
         RevealAnimFps            = 48
+        ResizeDebounceMs         = 180
     }
     Internet = @{
         PingTimeoutMs    = 400    # Снижено с 1000
@@ -419,8 +420,29 @@ $script:DnsCache = [hashtable]::Synchronized(@{}) # Сразу делаем ег
 $script:LastScanResults = @()
 # Уже был хотя бы один завершённый скан (для частичного «водопада» и отключения idle-арта)
 $script:HasCompletedScan = $false
+# Idle | Running | Finishing — guard against double Enter / mid-scan redraw races
+$script:ScanPhase = "Idle"
+# 0 = none / idle; interactive EXTRA uses ExtrasPending + async PS (not step 1..N)
+$script:ExtrasStep = 0
+$script:ExtrasPending = $false
+$script:ExtrasPs = $null
+$script:ExtrasHandle = $null
+$script:ExtrasRunspace = $null
+# Shared scan RunspacePool (reused across Enter scans)
+$script:ScanRunspacePool = $null
+$script:ScanRunspacePoolMax = 0
+$script:ScanRunspacePoolForceRecreate = $false
+# Table viewport scroll (large targets.txt)
+$script:TableScrollOffset = 0
+# Non-scroll key drained while coalescing arrow-key flood
+$script:PendingMainKey = $null
 $script:StatusFeedbackCacheKey = $null
 $script:StatusControlsCacheKey = $null
+$script:StatusBarLayoutW = $null
+$script:ResizePendingSince = $null
+$script:ResizePendingW = $null
+$script:ResizePendingH = $null
+$script:BypassWarnShownThisSession = $false
 
 # Фоновая задача для предзагрузки NetInfo
 $script:BackgroundNetInfo = $null
@@ -765,7 +787,7 @@ function New-ConfigObject {
         DebugLogFullIdentifiers = $false
         # Первый проход T13+T12 через ThreadPool Tasks в воркере нестабилен — по умолчанию выключено.
         ScanParallelTlsFirstPass = $false
-        WarnBypassTools = $true
+        WarnBypassTools = $false
         UiShowLatBars = $true
         UiExtraStrip = $false
         PathMaxHops = 15
@@ -825,6 +847,24 @@ function New-PlaceholderResultRow {
         Lat = "---"
         Verdict = "IDLE"
         Color = "DarkGray"
+    }
+}
+
+function New-AbortedResultRow {
+    param(
+        [int]$Number,
+        [string]$Target
+    )
+    return [PSCustomObject]@{
+        Number = $Number
+        Target = $Target
+        IP = "---"
+        HTTP = "---"
+        T12 = "---"
+        T13 = "---"
+        Lat = "---"
+        Verdict = "SCAN ABORTED"
+        Color = "Yellow"
     }
 }
 
@@ -1243,24 +1283,37 @@ function Get-Targets {
 # ====================================================================================
 function Out-Str($x, $y, $str, $color="White", $bg="Black") {
     try {
-        [Console]::CursorVisible = $false
+        if ($x -lt 0 -or $y -lt 0) { return }
+        $ww = [Console]::WindowWidth
+        $wh = [Console]::WindowHeight
+        if ($y -ge $wh -or $x -ge $ww) { return }
+        $s = [string]$str
+        $maxLen = $ww - $x
+        if ($maxLen -le 0) { return }
+        if ($s.Length -gt $maxLen) { $s = $s.Substring(0, $maxLen) }
+        if ($script:UiCursorHidden -ne $true) {
+            [Console]::CursorVisible = $false
+            $script:UiCursorHidden = $true
+        }
         [Console]::SetCursorPosition($x, $y)
         [Console]::ForegroundColor = $color
         [Console]::BackgroundColor = $bg
-        [Console]::Write($str)
+        [Console]::Write($s)
         [Console]::BackgroundColor = "Black"
     } catch {}
 }
 
 
 # ====================================================================================
-# YT-DPI 3.0 TUI ENGINE (framebuffer + classic NAV/STATUS footer + PATH mtr-lite)
+# YT-DPI 3.0 TUI ENGINE (classic NAV/STATUS footer + PATH mtr-lite)
+# UiFrame / Flush-UiFrame reserved for 3.1 — not used by Draw-UI yet.
 # ====================================================================================
 
 $script:UiMode = "Scan"   # Scan | Extra | Dns | Path
 $script:UiFrame = $null
 $script:UiFrameDirty = $false
 $script:LatBarMaxMs = 1
+$script:UiCursorHidden = $false
 
 function New-UiFrame {
     param([int]$Width, [int]$Height)
@@ -1470,27 +1523,507 @@ function Get-UiLayout {
     if ($TargetCount -le 0 -and $script:Targets) { $TargetCount = @($script:Targets).Count }
     $wh = 30
     try { $wh = [Console]::WindowHeight } catch { }
+    if ($wh -lt 8) { $wh = 8 }
+
     $tableStart = 9
     $tableHeader = 3
-    $tableBodyStart = $tableStart + $tableHeader
-    $tableEnd = $tableBodyStart + [Math]::Max(0, $TargetCount) - 1
-    # Classic footer only: NAV (keys) then STATUS under it. No ExtraStrip.
-    $navRow = $tableEnd + 2
-    $feedbackRow = $navRow + 1
-    if ($feedbackRow -ge $wh) {
-        $feedbackRow = $wh - 1
-        $navRow = [Math]::Max($tableEnd + 1, $feedbackRow - 1)
+    $tableBodyStart = $tableStart + $tableHeader   # 12
+    # Sticky footer: NAV + STATUS always at bottom of window.
+    $navRow = $wh - 2
+    $feedbackRow = $wh - 1
+    if ($navRow -le $tableBodyStart) {
+        $navRow = [Math]::Max(1, $wh - 2)
+        $feedbackRow = [Math]::Max($navRow + 1, $wh - 1)
+        if ($feedbackRow -ge $wh) { $feedbackRow = $wh - 1 }
+        if ($navRow -ge $feedbackRow) { $navRow = [Math]::Max(0, $feedbackRow - 1) }
     }
+
+    # Body + bottom rule must sit above NAV.
+    $maxBody = $navRow - $tableBodyStart - 1
+    if ($maxBody -lt 1) { $maxBody = 1 }
+    $visibleRows = [Math]::Min([Math]::Max(0, $TargetCount), $maxBody)
+    $tableEnd = $tableBodyStart + [Math]::Max(0, $visibleRows) - 1
+    $bottomRuleRow = $tableBodyStart + $visibleRows
+    if ($bottomRuleRow -ge $navRow) {
+        $visibleRows = [Math]::Max(1, $navRow - $tableBodyStart - 1)
+        $tableEnd = $tableBodyStart + $visibleRows - 1
+        $bottomRuleRow = $tableBodyStart + $visibleRows
+    }
+    $maxScroll = [Math]::Max(0, $TargetCount - $visibleRows)
+
     return [PSCustomObject]@{
         TableStart     = $tableStart
         TableBodyStart = $tableBodyStart
         TableEnd       = $tableEnd
+        VisibleRows    = $visibleRows
+        BottomRuleRow  = $bottomRuleRow
         ExtraStart     = $navRow
         ExtraHeight    = 0
         NavRow         = $navRow
         FeedbackRow    = $feedbackRow
         WindowHeight   = $wh
+        TargetCount    = $TargetCount
+        MaxScroll      = $maxScroll
     }
+}
+
+function Clamp-TableScroll {
+    param([int]$TargetCount = -1)
+    if ($TargetCount -lt 0) {
+        $TargetCount = if ($script:Targets) { @($script:Targets).Count } else { 0 }
+    }
+    if ($null -eq $script:TableScrollOffset) { $script:TableScrollOffset = 0 }
+    $layout = Get-UiLayout -TargetCount $TargetCount
+    $maxOff = [int]$layout.MaxScroll
+    if ($script:TableScrollOffset -lt 0) { $script:TableScrollOffset = 0 }
+    if ($script:TableScrollOffset -gt $maxOff) { $script:TableScrollOffset = $maxOff }
+    return $layout
+}
+
+function Get-TableScreenRow {
+    param(
+        [int]$TargetIndex,
+        [int]$TargetCount = -1
+    )
+    $layout = Clamp-TableScroll -TargetCount $TargetCount
+    $off = [int]$script:TableScrollOffset
+    $vis = [int]$layout.VisibleRows
+    if ($vis -le 0) { return -1 }
+    if ($TargetIndex -lt $off -or $TargetIndex -ge ($off + $vis)) { return -1 }
+    return ([int]$layout.TableBodyStart + ($TargetIndex - $off))
+}
+
+function Get-TableViewportIndexRange {
+    param([int]$TargetCount = -1)
+    if ($TargetCount -lt 0) {
+        $TargetCount = if ($script:Targets) { @($script:Targets).Count } else { 0 }
+    }
+    $layout = Clamp-TableScroll -TargetCount $TargetCount
+    $off = [int]$script:TableScrollOffset
+    $vis = [int]$layout.VisibleRows
+    if ($vis -le 0 -or $TargetCount -le 0) {
+        return [PSCustomObject]@{
+            StartIdx = 0
+            EndIdx   = -1
+            Layout   = $layout
+        }
+    }
+    $end = [Math]::Min($TargetCount, $off + $vis) - 1
+    return [PSCustomObject]@{
+        StartIdx = $off
+        EndIdx   = $end
+        Layout   = $layout
+    }
+}
+
+function Invoke-TableScrollKey {
+    param($Key)
+    $n = if ($script:Targets) { $script:Targets.Count } else { 0 }
+    if ($n -le 0) { return $false }
+    $layout = Clamp-TableScroll -TargetCount $n
+    $vis = [Math]::Max(1, [int]$layout.VisibleRows)
+    $old = [int]$script:TableScrollOffset
+    switch ([string]$Key) {
+        "UpArrow" { $script:TableScrollOffset-- }
+        "DownArrow" { $script:TableScrollOffset++ }
+        "PageUp" { $script:TableScrollOffset -= $vis }
+        "PageDown" { $script:TableScrollOffset += $vis }
+        "Home" { $script:TableScrollOffset = 0 }
+        "End" { $script:TableScrollOffset = [int]::MaxValue / 4 }
+        default { return $false }
+    }
+    $null = Clamp-TableScroll -TargetCount $n
+    return ([int]$script:TableScrollOffset -ne $old)
+}
+
+function Test-IsTableScrollKey {
+    param($Key)
+    # Prefer ConsoleKey enum equality (same as legacy $k -eq "UpArrow")
+    try {
+        return (
+            $Key -eq [ConsoleKey]::UpArrow -or
+            $Key -eq [ConsoleKey]::DownArrow -or
+            $Key -eq [ConsoleKey]::PageUp -or
+            $Key -eq [ConsoleKey]::PageDown -or
+            $Key -eq [ConsoleKey]::Home -or
+            $Key -eq [ConsoleKey]::End
+        )
+    } catch {
+        return ([string]$Key -in @("UpArrow", "DownArrow", "PageUp", "PageDown", "Home", "End"))
+    }
+}
+
+# Apply FirstKey + drain queued scroll keys, paint viewport once. Stashes non-scroll key in PendingMainKey.
+function Invoke-CoalescedTableScroll {
+    param(
+        $FirstKey,
+        $Results = $null
+    )
+    $oldOff = [int]$script:TableScrollOffset
+    $moved = [bool](Invoke-TableScrollKey $FirstKey)
+    while ([Console]::KeyAvailable) {
+        $nk = [Console]::ReadKey($true).Key
+        if (Test-IsTableScrollKey $nk) {
+            if (Invoke-TableScrollKey $nk) { $moved = $true }
+        } else {
+            $script:PendingMainKey = $nk
+            break
+        }
+    }
+    if ($moved) {
+        try {
+            $newOff = [int]$script:TableScrollOffset
+            $delta = $newOff - $oldOff
+            # Net scroll within one viewport: atomic buffer shift + paint only new rows.
+            # |delta|>=visibleRows -> full redraw (Home/End / large Page jumps).
+            $nQuick = if ($script:Targets) { [int]$script:Targets.Count } else { 0 }
+            $layQuick = $null
+            try { $layQuick = Get-UiLayout -TargetCount $nQuick } catch { }
+            $visQuick = if ($layQuick) { [int]$layQuick.VisibleRows } else { 1 }
+            if ($delta -ne 0 -and [Math]::Abs($delta) -lt [Math]::Max(1, $visQuick)) {
+                Update-TableViewportCellsDelta -Results $Results -Delta $delta
+            } else {
+                Update-TableViewportCells -Results $Results
+            }
+        } catch {
+            try { Update-TableViewportCells -Results $Results } catch { }
+        }
+    }
+    return $moved
+}
+
+function ConvertTo-UiConsoleColor {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return [ConsoleColor]::Gray }
+    try { return [System.Enum]::Parse([ConsoleColor], $Name, $true) } catch { return [ConsoleColor]::Gray }
+}
+
+function Set-BufferRowSpan {
+    param(
+        [System.Management.Automation.Host.BufferCell[,]]$Buf,
+        [int]$Row,
+        [int]$X,
+        [string]$Text,
+        [string]$Fg,
+        [string]$Bg = "Black",
+        [int]$BufWidth
+    )
+    if ($Row -lt 0 -or $X -lt 0 -or $X -ge $BufWidth) { return }
+    $fgc = ConvertTo-UiConsoleColor $Fg
+    $bgc = ConvertTo-UiConsoleColor $Bg
+    $s = [string]$Text
+    $max = $BufWidth - $X
+    if ($max -le 0) { return }
+    if ($s.Length -gt $max) { $s = $s.Substring(0, $max) }
+    for ($i = 0; $i -lt $s.Length; $i++) {
+        $Buf[$Row, ($X + $i)] = New-Object System.Management.Automation.Host.BufferCell (
+            [char]$s[$i], $fgc, $bgc, [System.Management.Automation.Host.BufferCellType]::Complete
+        )
+    }
+}
+
+function Clear-BufferRowLine {
+    param(
+        [System.Management.Automation.Host.BufferCell[,]]$Buf,
+        [int]$Row,
+        [int]$BufWidth
+    )
+    $blank = New-Object System.Management.Automation.Host.BufferCell (
+        [char]' ', [ConsoleColor]::Black, [ConsoleColor]::Black, [System.Management.Automation.Host.BufferCellType]::Complete
+    )
+    for ($x = 0; $x -lt $BufWidth; $x++) { $Buf[$Row, $x] = $blank }
+}
+
+function Fill-TableBodyRowBuffer {
+    param(
+        [System.Management.Automation.Host.BufferCell[,]]$Buf,
+        [int]$Row,
+        [int]$BufWidth,
+        [int]$TargetIndex,
+        $Results = $null,
+        [int]$ResultsCount = 0,
+        $Pos = $null
+    )
+    Clear-BufferRowLine -Buf $Buf -Row $Row -BufWidth $BufWidth
+    if (-not $script:Targets -or -not $Pos) { return }
+    $n = $script:Targets.Count
+    if ($TargetIndex -lt 0 -or $TargetIndex -ge $n) { return }
+
+    $tgt = [string]$script:Targets[$TargetIndex]
+    Set-BufferRowSpan -Buf $Buf -Row $Row -X ([int]$Pos.Num) -Text (Format-CellCenter (($TargetIndex + 1).ToString()) 4) -Fg "Cyan" -BufWidth $BufWidth
+    if ($tgt.Length -lt 42) { $tgtPad = $tgt.PadRight(42) }
+    elseif ($tgt.Length -gt 42) { $tgtPad = $tgt.Substring(0, 42) }
+    else { $tgtPad = $tgt }
+    Set-BufferRowSpan -Buf $Buf -Row $Row -X ([int]$Pos.Dom) -Text $tgtPad -Fg "Gray" -BufWidth $BufWidth
+
+    $res = $null
+    if ($TargetIndex -lt $ResultsCount) { $res = $Results[$TargetIndex] }
+    if ($null -eq $res) {
+        $res = New-PlaceholderResultRow -Number ($TargetIndex + 1) -Target $tgt
+    }
+
+    $ipWidth = if ($script:IpColumnWidth) { $script:IpColumnWidth } else { 16 }
+    $ipStr = if ($res.IP) { [string]$res.IP } else { "---" }
+    if ($ipStr.Length -gt $ipWidth) { $ipStr = $ipStr.Substring(0, $ipWidth - 2) + ".." }
+    Set-BufferRowSpan -Buf $Buf -Row $Row -X ([int]$Pos.IP) -Text ($ipStr.PadRight($ipWidth).Substring(0, $ipWidth)) -Fg "DarkGray" -BufWidth $BufWidth
+
+    $htStr = if ($res.HTTP) { [string]$res.HTTP } else { "---" }
+    $hCol = if ($htStr -eq "OK") { "Green" } elseif ($htStr -eq "---") { "DarkGray" } else { "Red" }
+    Set-BufferRowSpan -Buf $Buf -Row $Row -X ([int]$Pos.HTTP) -Text (Format-CellCenter $htStr 6) -Fg $hCol -BufWidth $BufWidth
+
+    $t12Str = if ($res.T12) { [string]$res.T12 } else { "---" }
+    $t12Str = Format-TlsCellDisplay -Cell $t12Str -RstPhase $res.RstPhase12
+    $t12Col = if ($t12Str -eq "OK") { "Green" } elseif ($t12Str -eq "N/A" -or $t12Str -eq "---") { "DarkGray" } else { "Red" }
+    Set-BufferRowSpan -Buf $Buf -Row $Row -X ([int]$Pos.T12) -Text (Format-CellCenter $t12Str 8) -Fg $t12Col -BufWidth $BufWidth
+
+    $t13Str = if ($res.T13) { [string]$res.T13 } else { "---" }
+    $t13Str = Format-TlsCellDisplay -Cell $t13Str -RstPhase $res.RstPhase13
+    $t13Col = if ($t13Str -eq "OK") { "Green" } elseif ($t13Str -eq "N/A" -or $t13Str -eq "---") { "DarkGray" } else { "Red" }
+    Set-BufferRowSpan -Buf $Buf -Row $Row -X ([int]$Pos.T13) -Text (Format-CellCenter $t13Str 8) -Fg $t13Col -BufWidth $BufWidth
+
+    $latStr = if ($res.Lat) { [string]$res.Lat } else { "---" }
+    $latCol = if ($latStr -eq "---") { "DarkGray" } else { "Cyan" }
+    $latW = 12
+    try {
+        if ($Pos.Ver -gt $Pos.Lat) { $latW = [Math]::Max(12, [int]$Pos.Ver - [int]$Pos.Lat - 2) }
+    } catch { }
+    $latCell = Format-LatCell -LatText $latStr -TotalWidth $latW -NumWidth 4 -BarWidth 6
+    Set-BufferRowSpan -Buf $Buf -Row $Row -X ([int]$Pos.Lat) -Text $latCell -Fg $latCol -BufWidth $BufWidth
+
+    $verStr = if ($res.Verdict) { [string]$res.Verdict } else { "UNKNOWN" }
+    $verCol = if ($res.Color) { [string]$res.Color } else { "Gray" }
+    Set-BufferRowSpan -Buf $Buf -Row $Row -X ([int]$Pos.Ver) -Text (Format-CellCenter $verStr 18) -Fg $verCol -BufWidth $BufWidth
+}
+
+function Write-TableBodyRowAt {
+    param(
+        [int]$TargetIndex,
+        [int]$ScreenRow,
+        $Results = $null,
+        [int]$ResultsCount = -1,
+        $Pos = $null
+    )
+    if (-not $script:Targets) { return }
+    $n = $script:Targets.Count
+    if ($ScreenRow -lt 0) { return }
+    try {
+        $wh = [Console]::WindowHeight
+        if ($ScreenRow -ge ($wh - 2)) { return }
+    } catch { }
+    if (-not $Pos) {
+        if (-not $script:DynamicColPos) { Sync-DynamicColPosFromLayout }
+        $Pos = $script:DynamicColPos
+    }
+    $width = [Console]::WindowWidth
+    if ($TargetIndex -lt 0 -or $TargetIndex -ge $n) {
+        Out-Str 0 $ScreenRow (" " * $width) "Black" "Black"
+        return
+    }
+    if ($ResultsCount -lt 0) {
+        $ResultsCount = 0
+        if ($null -ne $Results) {
+            try { $ResultsCount = [int]$Results.Count } catch { $ResultsCount = @($Results).Count }
+        }
+    }
+    $tgt = [string]$script:Targets[$TargetIndex]
+    Out-Str $Pos.Num $ScreenRow (Format-CellCenter (($TargetIndex + 1).ToString()) 4) "Cyan"
+    if ($tgt.Length -lt 42) { $tgtPad = $tgt.PadRight(42) }
+    elseif ($tgt.Length -gt 42) { $tgtPad = $tgt.Substring(0, 42) }
+    else { $tgtPad = $tgt }
+    Out-Str $Pos.Dom $ScreenRow $tgtPad "Gray"
+    $res = $null
+    if ($TargetIndex -lt $ResultsCount) { $res = $Results[$TargetIndex] }
+    if ($null -eq $res) {
+        $res = New-PlaceholderResultRow -Number ($TargetIndex + 1) -Target $tgt
+    }
+    Write-ResultLine -row $ScreenRow -result $res -TrustedBodyRow
+}
+
+function Update-TableViewportCellsDelta {
+    param(
+        $Results = $null,
+        [int]$Delta = 0
+    )
+    if (-not $script:Targets) { return }
+    if ($Delta -eq 0) { return }
+    if ($script:UiCursorHidden -ne $true) {
+        [Console]::CursorVisible = $false
+        $script:UiCursorHidden = $true
+    }
+    if (-not $script:DynamicColPos) { Sync-DynamicColPosFromLayout }
+
+    $n = $script:Targets.Count
+    $layout = Clamp-TableScroll -TargetCount $n
+    $off = [int]$script:TableScrollOffset
+    $vis = [int]$layout.VisibleRows
+    $bodyStart = [int]$layout.TableBodyStart
+    $navRow = [int]$layout.NavRow
+    $width = [Console]::WindowWidth
+    $pos = $script:DynamicColPos
+
+    # Never paint into sticky footer even if WindowHeight reports large.
+    try {
+        $wh = [Console]::WindowHeight
+        if ($navRow -ge $wh) { $navRow = $wh - 2 }
+        $maxVis = [Math]::Max(1, $navRow - $bodyStart - 1)
+        if ($vis -gt $maxVis) { $vis = $maxVis }
+    } catch { }
+
+    $step = [Math]::Abs($Delta)
+    if ($vis -le 1 -or $step -ge $vis) {
+        Update-TableViewportCells -Results $Results
+        return
+    }
+
+    if ($null -eq $Results) { $Results = Get-MainTableResults }
+    $resCount = 0
+    if ($null -ne $Results) {
+        try { $resCount = [int]$Results.Count } catch { $resCount = @($Results).Count }
+    }
+
+    # Atomic body update: shift BufferCell[,] in memory + one SetBufferContents (no MoveBufferArea / cell Out-Str flicker).
+    try {
+        $raw = $Host.UI.RawUI
+        $bw = [Math]::Min($width, [int]$raw.BufferSize.Width)
+        if ($bw -lt 8) { throw "buffer too narrow" }
+        $right = $bw - 1
+        $bottom = $bodyStart + $vis - 1
+        $rect = New-Object System.Management.Automation.Host.Rectangle 0, $bodyStart, $right, $bottom
+        $buf = $raw.GetBufferContents($rect)
+        $h = $buf.GetLength(0)
+        $w = $buf.GetLength(1)
+        if ($h -lt $vis) { $vis = $h }
+        if ($step -ge $vis) { throw "step>=vis after get" }
+
+        if ($Delta -gt 0) {
+            for ($r = 0; $r -lt ($vis - $step); $r++) {
+                for ($x = 0; $x -lt $w; $x++) { $buf[$r, $x] = $buf[($r + $step), $x] }
+            }
+            for ($s = 0; $s -lt $step; $s++) {
+                $slot = ($vis - $step) + $s
+                Fill-TableBodyRowBuffer -Buf $buf -Row $slot -BufWidth $w -TargetIndex ($off + $slot) `
+                    -Results $Results -ResultsCount $resCount -Pos $pos
+            }
+        } else {
+            for ($r = ($vis - 1); $r -ge $step; $r--) {
+                for ($x = 0; $x -lt $w; $x++) { $buf[$r, $x] = $buf[($r - $step), $x] }
+            }
+            for ($s = 0; $s -lt $step; $s++) {
+                Fill-TableBodyRowBuffer -Buf $buf -Row $s -BufWidth $w -TargetIndex ($off + $s) `
+                    -Results $Results -ResultsCount $resCount -Pos $pos
+            }
+        }
+        $origin = New-Object System.Management.Automation.Host.Coordinates 0, $bodyStart
+        $raw.SetBufferContents($origin, $buf)
+        Update-TableBottomScrollRule -Layout $layout
+    } catch {
+        # Fallback: MoveBufferArea + Out-Str path
+        try {
+            if ($Delta -gt 0) {
+                [Console]::MoveBufferArea(0, ($bodyStart + $step), $width, ($vis - $step), 0, $bodyStart)
+                for ($s = 0; $s -lt $step; $s++) {
+                    $slot = ($vis - $step) + $s
+                    $rowNew = $bodyStart + $slot
+                    if ($rowNew -ge $navRow) { break }
+                    Write-TableBodyRowAt -TargetIndex ($off + $slot) -ScreenRow $rowNew -Results $Results -ResultsCount $resCount -Pos $pos
+                }
+            } else {
+                [Console]::MoveBufferArea(0, $bodyStart, $width, ($vis - $step), 0, ($bodyStart + $step))
+                for ($s = 0; $s -lt $step; $s++) {
+                    $rowNew = $bodyStart + $s
+                    if ($rowNew -ge $navRow) { break }
+                    Write-TableBodyRowAt -TargetIndex ($off + $s) -ScreenRow $rowNew -Results $Results -ResultsCount $resCount -Pos $pos
+                }
+            }
+            Update-TableBottomScrollRule -Layout $layout
+        } catch {
+            Update-TableViewportCells -Results $Results
+        }
+    }
+}
+
+function Update-TableBottomScrollRule {
+    param($Layout = $null, [int]$TargetCount = -1)
+    if ($null -eq $Layout) {
+        if ($TargetCount -lt 0) {
+            $TargetCount = if ($script:Targets) { @($script:Targets).Count } else { 0 }
+        }
+        $Layout = Clamp-TableScroll -TargetCount $TargetCount
+    }
+    $width = [Console]::WindowWidth
+    $bottomRule = [int]$Layout.BottomRuleRow
+    $off = [int]$script:TableScrollOffset
+    $vis = [int]$Layout.VisibleRows
+    $n = [int]$Layout.TargetCount
+    $rule = ("=" * $width)
+    if ($Layout.MaxScroll -gt 0 -and $n -gt 0) {
+        $from = $off + 1
+        $to = [Math]::Min($n, $off + $vis)
+        $hint = " $from-$to/$n  Up/Dn PgUp/PgDn "
+        if ($hint.Length + 4 -lt $width) {
+            $left = [Math]::Floor(($width - $hint.Length) / 2)
+            if ($left -lt 2) { $left = 2 }
+            $rule = ("=" * $left) + $hint + ("=" * [Math]::Max(0, $width - $left - $hint.Length))
+            if ($rule.Length -gt $width) { $rule = $rule.Substring(0, $width) }
+        }
+    }
+    Out-Str 0 $bottomRule $rule "DarkCyan"
+}
+
+function Update-TableViewportCells {
+    param($Results = $null)
+    # Fast scroll path: body cells + bottom rule only. No Clear / logo / STATUS / Add-Member.
+    if (-not $script:Targets) { return }
+    if ($script:UiCursorHidden -ne $true) {
+        [Console]::CursorVisible = $false
+        $script:UiCursorHidden = $true
+    }
+    if (-not $script:DynamicColPos) { Sync-DynamicColPosFromLayout }
+
+    $n = $script:Targets.Count
+    $layout = Clamp-TableScroll -TargetCount $n
+    $off = [int]$script:TableScrollOffset
+    $vis = [int]$layout.VisibleRows
+    $bodyStart = [int]$layout.TableBodyStart
+    $navRow = [int]$layout.NavRow
+    $pos = $script:DynamicColPos
+    if (-not $pos) { Sync-DynamicColPosFromLayout; $pos = $script:DynamicColPos }
+    try {
+        $wh = [Console]::WindowHeight
+        if ($navRow -ge $wh) { $navRow = $wh - 2 }
+        $maxVis = [Math]::Max(1, $navRow - $bodyStart - 1)
+        if ($vis -gt $maxVis) { $vis = $maxVis }
+    } catch { }
+
+    if ($null -eq $Results) { $Results = Get-MainTableResults }
+    $resCount = 0
+    if ($null -ne $Results) {
+        try { $resCount = [int]$Results.Count } catch { $resCount = @($Results).Count }
+    }
+
+    for ($slot = 0; $slot -lt $vis; $slot++) {
+        $i = $off + $slot
+        $row = $bodyStart + $slot
+        if ($row -ge $navRow) { break }
+        Write-TableBodyRowAt -TargetIndex $i -ScreenRow $row -Results $Results -ResultsCount $resCount -Pos $pos
+    }
+    Update-TableBottomScrollRule -Layout $layout
+}
+
+function Invoke-TableViewportRedraw {
+    param(
+        $Results = $null,
+        [bool]$ClearScreen = $false
+    )
+    if ($ClearScreen) {
+        $rows = $Results
+        if ($null -eq $rows) { $rows = Get-MainTableResults }
+        $null = Clamp-TableScroll
+        Draw-UI $script:NetInfo $script:Targets $rows $true
+        Draw-StatusBar
+        return
+    }
+    Update-TableViewportCells -Results $Results
 }
 
 function Get-ExtraChipLine {
@@ -1508,9 +2041,6 @@ function Get-ExtraChipLine {
     }
     if ($script:ExtraDiag.IpVsSni) {
         [void]$parts.Add(("SNI {0}" -f $script:ExtraDiag.IpVsSni.Status))
-    }
-    if ($script:ExtraDiag.BypassTools -and $script:ExtraDiag.BypassTools.Detected) {
-        [void]$parts.Add("BYPASS!")
     }
     if ($parts.Count -eq 0) { return "[ EXTRA ] (run scan)" }
     return "[ EXTRA ] " + ($parts -join " | ")
@@ -1620,8 +2150,81 @@ function Invoke-IcmpTtlPathProbe {
     return $hops
 }
 
+function Test-ActiveVpnAdapterHint {
+    # Best-effort: common VPN/tunnel adapters. False negatives OK — proxy + hop collapse still catch most cases.
+    try {
+        $up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" })
+        foreach ($a in $up) {
+            $blob = ("{0} {1}" -f $a.Name, $a.InterfaceDescription)
+            if ($blob -match '(?i)TAP|TUN|Wintun|WireGuard|OpenVPN|NordLynx|Cloudflare|WARP|ZeroTier|Hamachi|SoftEther|AnyConnect|GlobalProtect|Outline|Mullvad|Proton|VPN') {
+                return [string]$a.Name
+            }
+        }
+    } catch { }
+    return $null
+}
+
+function Get-PathProbeBlockReason {
+    # PATH is raw ICMP TTL — it never goes through app HTTP/SOCKS proxy and is useless inside most VPN tunnels.
+    if ($global:ProxyConfig -and $global:ProxyConfig.Enabled) {
+        $px = "{0} {1}:{2}" -f $global:ProxyConfig.Type, $global:ProxyConfig.Host, $global:ProxyConfig.Port
+        return ("Включён прокси ($px). PATH не ходит через прокси (сырой ICMP) — отключите прокси в [P] или проверьте маршрут иначе.")
+    }
+    $vpn = Test-ActiveVpnAdapterHint
+    if ($vpn) {
+        return ("Похож активный VPN ($vpn). Часто сырой ICMP PATH схлопывается (1 hop / 0 ms) — отключите VPN или туннель.")
+    }
+    return $null
+}
+
+function Test-PathHopsCollapsedTunnel {
+    param(
+        $Hops,
+        [string]$DestIp = $null
+    )
+    $real = @($Hops | Where-Object { $_ -and $_.Hop -gt 0 })
+    if ($real.Count -eq 0) { return $true }
+    if ($real.Count -gt 2) { return $false }
+    $h1 = $real[0]
+    $ip = if ($h1.Ip) { [string]$h1.Ip } else { "" }
+    $avg = if ($null -ne $h1.Avg) { [double]$h1.Avg } else { -1 }
+    $toDest = ($h1.Status -eq "DONE") -or ($DestIp -and $ip -eq $DestIp)
+    # Typical VPN/proxy illusion: destination appears as hop 1 with near-zero RTT.
+    if ($toDest -and $avg -ge 0 -and $avg -le 8) { return $true }
+    if ($real.Count -eq 1 -and $toDest) { return $true }
+    return $false
+}
+
+function Show-PathUnavailableScreen {
+    param([string]$Reason, [string]$Target = $null)
+    [Console]::Clear()
+    [Console]::CursorVisible = $false
+    Write-Host ""
+    Write-Host " YT-DPI PATH — недоступно" -ForegroundColor Yellow
+    Write-Host (" " + ("-" * 60)) -ForegroundColor DarkGray
+    Write-Host ""
+    if ($Target) {
+        Write-Host (" Цель: {0}" -f $Target) -ForegroundColor Gray
+        Write-Host ""
+    }
+    Write-Host (" {0}" -f $Reason) -ForegroundColor White
+    Write-Host ""
+    Write-Host " ICMP TTL не идёт через HTTP/SOCKS-прокси и часто врёт" -ForegroundColor DarkGray
+    Write-Host " внутри туннеля VPN (ложный «прямой» маршрут)." -ForegroundColor DarkGray
+    Write-Host " Для диагностики DPI используйте обычный Enter-скан таблицы." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host " Esc/Enter — назад" -ForegroundColor DarkGray
+    while ($true) {
+        if ([Console]::KeyAvailable) {
+            $k = [Console]::ReadKey($true).Key
+            if ($k -in @("Enter", "Escape", "Spacebar", "G")) { break }
+        }
+        Start-Sleep -Milliseconds 40
+    }
+}
+
 function Show-PathProbeScreen {
-    param([string]$Target, $Hops)
+    param([string]$Target, $Hops, [string]$Note = $null)
     [Console]::Clear()
     [Console]::CursorVisible = $false
     $w = [Console]::WindowWidth
@@ -1633,6 +2236,10 @@ function Show-PathProbeScreen {
     Write-Host ""
     Write-Host (" YT-DPI PATH (ICMP TTL) -> {0}" -f $Target) -ForegroundColor Cyan
     Write-Host (" {0}" -f ("-" * [Math]::Min(78, $w - 2))) -ForegroundColor DarkGray
+    if ($Note) {
+        Write-Host (" ! {0}" -f $Note) -ForegroundColor Yellow
+        Write-Host (" {0}" -f ("-" * [Math]::Min(78, $w - 2))) -ForegroundColor DarkGray
+    }
     Write-Host (" {0,-4} {1,-16} {2,5} {3,5} {4,5} {5,5}  {6}" -f "Hop", "IP", "Loss", "Last", "Avg", "Best", "RTT") -ForegroundColor White
     $maxAvg = 1.0
     foreach ($h in @($Hops)) {
@@ -1688,13 +2295,26 @@ function Invoke-PathScanAction {
     Write-DebugLog "PATH mtr-lite [G]"
     $row = Get-FeedbackRow -count $(if ($script:Targets) { $script:Targets.Count } else { 0 })
     Write-StatusLine -Row $row -Message "" -Fg "White" -Bg "Black"
+
+    $block = Get-PathProbeBlockReason
+    if ($block) {
+        Write-DebugLog "PATH blocked: $block" "INFO"
+        Show-PathUnavailableScreen -Reason $block
+        Restore-MainUiConsole
+        Update-ConsoleSize
+        Draw-UI $script:NetInfo $script:Targets (Get-MainTableResults) $true
+        Draw-StatusBar
+        Clear-KeyBuffer
+        return
+    }
+
     if (-not $script:Targets -or $script:Targets.Count -eq 0) {
-        Write-StatusLine -Row $row -Message "[ PATH ] No targets" -Fg "White" -Bg "DarkRed"
+        Write-StatusLine -Row $row -Message "[ PATH ] Нет целей" -Fg "White" -Bg "DarkRed"
         Start-Sleep -Seconds 2
         Draw-StatusBar
         return
     }
-    $promptMsg = "[ PATH ] Domain # (1..$($script:Targets.Count), Enter=CDN): "
+    $promptMsg = "[ PATH ] № домена (1..$($script:Targets.Count), Enter=CDN): "
     $input = Read-StatusBarNumberInput -Row $row -Prompt $promptMsg
     $row = Get-FeedbackRow -count $script:Targets.Count
     [Console]::CursorVisible = $false
@@ -1708,17 +2328,29 @@ function Invoke-PathScanAction {
     } elseif ([int]::TryParse($input, [ref]$idx) -and $idx -ge 1 -and $idx -le $script:Targets.Count) {
         $target = [string]$script:Targets[$idx - 1]
     } else {
-        Write-StatusLine -Row $row -Message "[ PATH ] Invalid number" -Fg "White" -Bg "DarkRed"
+        Write-StatusLine -Row $row -Message "[ PATH ] Неверный номер" -Fg "White" -Bg "DarkRed"
         Start-Sleep -Seconds 2
         Draw-StatusBar
         Clear-KeyBuffer
         return
     }
+
+    $block2 = Get-PathProbeBlockReason
+    if ($block2) {
+        Show-PathUnavailableScreen -Reason $block2 -Target $target
+        Restore-MainUiConsole
+        Update-ConsoleSize
+        Draw-UI $script:NetInfo $script:Targets (Get-MainTableResults) $true
+        Draw-StatusBar
+        Clear-KeyBuffer
+        return
+    }
+
     $maxHops = 15; $samples = 3; $interval = 200
     try { if ($script:Config.PathMaxHops) { $maxHops = [int]$script:Config.PathMaxHops } } catch { }
     try { if ($script:Config.PathSamples) { $samples = [int]$script:Config.PathSamples } } catch { }
     try { if ($script:Config.PathIntervalMs) { $interval = [int]$script:Config.PathIntervalMs } } catch { }
-    Write-StatusLine -Row $row -Message "[ PATH ] Probing $target (ICMP TTL, Esc cancel)..." -Fg "White" -Bg "DarkCyan"
+    Write-StatusLine -Row $row -Message "[ PATH ] Зонд $target (ICMP TTL, Esc — отмена)..." -Fg "White" -Bg "DarkCyan"
     $hops = @()
     try {
         $hops = @(Invoke-IcmpTtlPathProbe -Target $target -MaxHops $maxHops -Samples $samples -IntervalMs $interval -OnProgress {
@@ -1729,12 +2361,31 @@ function Invoke-PathScanAction {
             })
     } catch {
         Write-DebugLog "PATH probe: $_" "ERROR"
-        Write-StatusLine -Row $row -Message ("[ PATH ] Error: {0}" -f $_.Exception.Message) -Fg "White" -Bg "DarkRed"
+        Write-StatusLine -Row $row -Message ("[ PATH ] Ошибка: {0}" -f $_.Exception.Message) -Fg "White" -Bg "DarkRed"
         Start-Sleep -Seconds 3
         Draw-StatusBar
         Clear-KeyBuffer
         return
     }
+
+    $destIp = $null
+    try {
+        $destIp = ([System.Net.Dns]::GetHostAddresses($target) |
+            Where-Object { $_.AddressFamily -eq "InterNetwork" } |
+            Select-Object -First 1).IPAddressToString
+    } catch { }
+
+    if (Test-PathHopsCollapsedTunnel -Hops $hops -DestIp $destIp) {
+        Write-DebugLog "PATH collapsed tunnel-like result for $target" "INFO"
+        Show-PathUnavailableScreen -Target $target -Reason "Трасса схлопнулась (1 hop / ~0 ms до цели) — похоже на VPN или прозрачный туннель. ICMP PATH здесь неинформативен."
+        Restore-MainUiConsole
+        Update-ConsoleSize
+        Draw-UI $script:NetInfo $script:Targets (Get-MainTableResults) $true
+        Draw-StatusBar
+        Clear-KeyBuffer
+        return
+    }
+
     Show-PathProbeScreen -Target $target -Hops $hops
     Restore-MainUiConsole
     Update-ConsoleSize
@@ -1748,18 +2399,24 @@ function Invoke-ExtraViewAction {
     [Console]::Clear()
     [Console]::CursorVisible = $false
     Write-Host ""
-    Write-Host " YT-DPI EXTRA DIAG" -ForegroundColor Cyan
+    Write-Host " YT-DPI доп. диагностика" -ForegroundColor Cyan
     Write-Host (" " + ("-" * 60)) -ForegroundColor DarkGray
     if (Get-Command Format-ExtraDiagText -ErrorAction SilentlyContinue) {
         $txt = Format-ExtraDiagText
+        $hasBody = $false
         foreach ($line in ($txt -split "`r?`n")) {
+            if ([string]::IsNullOrWhiteSpace($line)) { Write-Host ""; continue }
             Write-Host (" " + $line) -ForegroundColor Gray
+            $hasBody = $true
+        }
+        if (-not $hasBody) {
+            Write-Host " (данных ещё нет — сначала выполните скан Enter)" -ForegroundColor DarkGray
         }
     } else {
-        Write-Host " (no extra data yet — run Enter scan)" -ForegroundColor DarkGray
+        Write-Host " (данных ещё нет — сначала выполните скан Enter)" -ForegroundColor DarkGray
     }
     Write-Host ""
-    Write-Host " Esc/Enter - back" -ForegroundColor DarkGray
+    Write-Host " Esc/Enter — назад" -ForegroundColor DarkGray
     while ($true) {
         if ([Console]::KeyAvailable) {
             $k = [Console]::ReadKey($true).Key
@@ -1832,18 +2489,20 @@ function Update-ConsoleSize {
     try {
         [Console]::CursorVisible = $false
         try { [Console]::CursorSize = 1 } catch { }
-        [Console]::SetCursorPosition(0, 0)
-        $linesNeeded = $script:Targets.Count + 20
+        try { [Console]::SetCursorPosition(0, 0) } catch { }
+        # Do not grow window to fit all targets — table uses a scroll viewport.
+        $h = 30
+        try { $h = [Console]::WindowHeight } catch { }
+        if ($h -lt 8) { $h = 8 }
         $maxHeight = [Console]::LargestWindowHeight
-        if ($linesNeeded -gt $maxHeight) {
-            Write-DebugLog "Предупреждение: требуется $linesNeeded строк, доступно только $maxHeight"
-            $linesNeeded = $maxHeight
-            $script:Truncated = $true
-        } else {
-            $script:Truncated = $false
-        }
+        if ($h -gt $maxHeight) { $h = $maxHeight }
+        $script:Truncated = $false
+        try {
+            $layout = Get-UiLayout -TargetCount $(if ($script:Targets) { $script:Targets.Count } else { 0 })
+            if ($layout.MaxScroll -gt 0) { $script:Truncated = $true }
+        } catch { }
+
         $w = if ($script:DesiredConsoleWidth) { [int]$script:DesiredConsoleWidth } else { 135 }
-        $h = $linesNeeded
         $maxWidth = [Console]::LargestWindowWidth
         if ($w -gt $maxWidth) { $w = $maxWidth }
 
@@ -1858,10 +2517,12 @@ function Update-ConsoleSize {
                 $script:CurrentWindowHeight = $h
             }
             else {
-                if ([Console]::BufferWidth -lt $w) { [Console]::BufferWidth = $w }
-                if ([Console]::BufferHeight -lt $h) { [Console]::BufferHeight = $h }
-                $script:CurrentWindowWidth = [Console]::WindowWidth
-                $script:CurrentWindowHeight = [Console]::WindowHeight
+                $cw = [Console]::WindowWidth
+                $ch = [Console]::WindowHeight
+                if ([Console]::BufferWidth -lt $cw) { [Console]::BufferWidth = $cw }
+                if ([Console]::BufferHeight -lt $ch) { [Console]::BufferHeight = $ch }
+                $script:CurrentWindowWidth = $cw
+                $script:CurrentWindowHeight = $ch
             }
         } catch {
             Write-DebugLog "Не удалось изменить размер окна: $_"
@@ -1905,6 +2566,46 @@ function Test-UiConsoleLayoutChanged {
     } catch { return $false }
 }
 
+function Get-UiResizeDebounceMs {
+    if ($CONST.UiScan -and $null -ne $CONST.UiScan.ResizeDebounceMs) {
+        return [int]$CONST.UiScan.ResizeDebounceMs
+    }
+    return 180
+}
+
+# Returns $true once size has been stable for ResizeDebounceMs after a change.
+function Test-UiConsoleResizeSettled {
+    try {
+        $cw = [Console]::WindowWidth
+        $ch = [Console]::WindowHeight
+        if ($null -eq $script:UiLayoutWidth -or $null -eq $script:UiLayoutHeight) {
+            Update-UiConsoleSnapshot
+            $script:ResizePendingSince = $null
+            return $false
+        }
+        $changed = ($cw -ne $script:UiLayoutWidth -or $ch -ne $script:UiLayoutHeight)
+        if (-not $changed) {
+            if ($null -eq $script:ResizePendingSince) { return $false }
+            # Size matched snapshot again mid-debounce — still wait until pending settles to new size
+        }
+        $now = [Environment]::TickCount64
+        $debounce = Get-UiResizeDebounceMs
+        if ($null -eq $script:ResizePendingSince -or
+            $cw -ne $script:ResizePendingW -or $ch -ne $script:ResizePendingH) {
+            $script:ResizePendingSince = $now
+            $script:ResizePendingW = $cw
+            $script:ResizePendingH = $ch
+            return $false
+        }
+        if (($now - $script:ResizePendingSince) -lt $debounce) { return $false }
+        if ($cw -eq $script:UiLayoutWidth -and $ch -eq $script:UiLayoutHeight) {
+            $script:ResizePendingSince = $null
+            return $false
+        }
+        return $true
+    } catch { return $false }
+}
+
 # Во время скана сравниваем с локальным снимком и порогом >1 колонка/строка — иначе дребезг
 # WindowWidth/Height даёт ложные «ресайзы» и полный Draw-UI на каждом тике статус-бара.
 function Test-ScanPhaseConsoleLayoutChanged {
@@ -1914,17 +2615,28 @@ function Test-ScanPhaseConsoleLayoutChanged {
             $ch = [Console]::WindowHeight
             $dw = [Math]::Abs($cw - $script:ScanLayoutSnapW)
             $dh = [Math]::Abs($ch - $script:ScanLayoutSnapH)
-            return ($dw -gt 1 -or $dh -gt 1)
+            if ($dw -le 1 -and $dh -le 1) {
+                $script:ResizePendingSince = $null
+                return $false
+            }
+            return (Test-UiConsoleResizeSettled)
         }
-        return (Test-UiConsoleLayoutChanged)
+        return (Test-UiConsoleResizeSettled)
     } catch { return $false }
 }
 
 function Invoke-FullUiRedrawIfConsoleResized {
-    if (-not (Test-UiConsoleLayoutChanged)) { return $false }
-    Write-DebugLog "Изменён размер консоли — полная перерисовка UI" "INFO"
+    param([switch]$Force)
+    if (-not $Force) {
+        if (-not (Test-UiConsoleResizeSettled)) { return $false }
+    } else {
+        if (-not (Test-UiConsoleLayoutChanged)) { return $false }
+    }
+    Write-DebugLog "Изменён размер консоли — полная перерисовка UI (Force=$Force)" "INFO"
+    $script:ResizePendingSince = $null
     Restore-MainUiConsole
     Update-ConsoleSize
+    $null = Clamp-TableScroll
     $scanRows = $null
     if ($script:LastScanResults -and $script:Targets -and $script:LastScanResults.Count -eq $script:Targets.Count) {
         $scanRows = $script:LastScanResults
@@ -1932,6 +2644,7 @@ function Invoke-FullUiRedrawIfConsoleResized {
     if ($scanRows) { Update-LatBarScale -Results $scanRows }
     Draw-UI $script:NetInfo $script:Targets $scanRows $true
     Sync-DynamicColPosFromLayout
+    Clear-StatusBlock
     Draw-StatusBar
     Update-UiConsoleSnapshot
     return $true
@@ -1946,11 +2659,14 @@ function Invoke-ScanRedrawIfConsoleResized {
     )
     $resized = Test-ScanPhaseConsoleLayoutChanged
     if ($resized) {
-        Write-DebugLog "Ресайз во время скана — перерисовка (без Clear)" "INFO"
+        Write-DebugLog "Ресайз во время скана — полная перерисовка (Clear)" "INFO"
+        $script:ResizePendingSince = $null
         Update-ConsoleSize
+        $null = Clamp-TableScroll -TargetCount $(if ($Targets) { $Targets.Count } else { 0 })
         if ($LiveResults) { Update-LatBarScale -Results $LiveResults }
-        Draw-UI $script:NetInfo $Targets $LiveResults $false
+        Draw-UI $script:NetInfo $Targets $LiveResults $true
         Sync-DynamicColPosFromLayout
+        Clear-StatusBlock
         try {
             $script:ScanLayoutSnapW = [Console]::WindowWidth
             $script:ScanLayoutSnapH = [Console]::WindowHeight
@@ -1973,15 +2689,31 @@ function Invoke-ScanRedrawIfConsoleResized {
 }
 
 function Read-MainLoopKey {
-    $pollMs = 50
+    $pollMs = 20
     while ($true) {
-        [Console]::CursorVisible = $false
+        if ($null -ne $script:PendingMainKey) {
+            $pk = $script:PendingMainKey
+            $script:PendingMainKey = $null
+            return $pk
+        }
+        if ($script:UiCursorHidden -ne $true) {
+            [Console]::CursorVisible = $false
+            $script:UiCursorHidden = $true
+        }
         try { [Console]::CursorSize = 1 } catch { }
-        if (Test-UiConsoleLayoutChanged) {
+        if (Test-UiConsoleResizeSettled) {
             $null = Invoke-FullUiRedrawIfConsoleResized
+        }
+        elseif (Test-UiConsoleLayoutChanged) {
+            # Size changed but debounce not settled — keep polling without redraw spam
+            $null = Test-UiConsoleResizeSettled
         }
         if ([Console]::KeyAvailable) {
             return [Console]::ReadKey($true).Key
+        }
+        # Prefer keys over EXTRA: poll async EXTRA; never run probes on the UI thread.
+        if ($script:ExtrasPending -and $script:ScanPhase -eq "Idle") {
+            if (Update-ExtrasFromCompletedAsync) { continue }
         }
         $nowNet = [Environment]::TickCount64
         if ($null -eq $script:_netInfoPollMs) { $script:_netInfoPollMs = $nowNet }
@@ -2073,9 +2805,12 @@ function Read-StatusBarNumberInput {
     $inputText = ""
     $currentRow = $Row
     while ($true) {
-        if (Test-UiConsoleLayoutChanged) {
+        if (Test-UiConsoleResizeSettled) {
             $null = Invoke-FullUiRedrawIfConsoleResized
             $currentRow = Get-FeedbackRow -count $script:Targets.Count
+        }
+        elseif (Test-UiConsoleLayoutChanged) {
+            $null = Test-UiConsoleResizeSettled
         }
 
         Write-StatusLine -Row $currentRow -Message ($Prompt + $inputText) -Fg "Black" -Bg "Green"
@@ -2105,11 +2840,13 @@ function Read-StatusBarNumberInput {
 function Reset-StatusBarCache {
     $script:StatusFeedbackCacheKey = $null
     $script:StatusControlsCacheKey = $null
+    $script:StatusBarLayoutW = $null
 }
 
 function Restore-MainUiConsole {
     # After full-screen menus the buffer may be scrolled; reset viewport without
     # forcibly shrinking BufferHeight (that clipped table/ExtraStrip and broke bars).
+    # Do NOT zero CurrentWindowWidth/Height — that would re-force Window size via Update-ConsoleSize.
     try {
         try {
             $raw = $Host.UI.RawUI
@@ -2118,12 +2855,17 @@ function Restore-MainUiConsole {
         } catch {
             try { [Console]::SetCursorPosition(0, 0) } catch { }
         }
+        try {
+            $script:CurrentWindowWidth = [Console]::WindowWidth
+            $script:CurrentWindowHeight = [Console]::WindowHeight
+        } catch { }
     } catch {
         Write-DebugLog "Restore-MainUiConsole: $_" "WARN"
     }
     Reset-StatusBarCache
-    $script:CurrentWindowWidth = 0
-    $script:CurrentWindowHeight = 0
+    $script:StatusBarLayoutW = $null
+    $script:ResizePendingSince = $null
+    $script:UiCursorHidden = $false
 }
 
 function Clear-StatusBlock {
@@ -2141,19 +2883,31 @@ function Get-IdleStatusMessage {
         return [PSCustomObject]@{ Text = "STATUS: ГОТОВ"; Fg = "Black"; Bg = "Green" }
     }
 
-    $rows = @($script:LastScanResults | Where-Object { $_ })
-    if ($rows.Count -lt 1) {
+    $available = 0; $throttled = 0; $dpi = 0; $ipBlock = 0
+    $timeout = 0; $unknown = 0; $aborted = 0; $rows = 0
+    foreach ($r in $script:LastScanResults) {
+        if (-not $r) { continue }
+        $rows++
+        switch ([string]$r.Verdict) {
+            "AVAILABLE" { $available++; break }
+            "THROTTLED" { $throttled++; break }
+            "DPI RESET" { $dpi++; break }
+            "DPI BLOCK" { $dpi++; break }
+            "IP BLOCK" { $ipBlock++; break }
+            "TIMEOUT" { $timeout++; break }
+            "UNKNOWN" { $unknown++; break }
+            "SCAN ABORTED" { $aborted++; break }
+        }
+    }
+    if ($rows -lt 1) {
         return [PSCustomObject]@{ Text = "STATUS: ГОТОВ"; Fg = "Black"; Bg = "Green" }
     }
 
-    $available = @($rows | Where-Object { $_.Verdict -eq "AVAILABLE" }).Count
-    $throttled = @($rows | Where-Object { $_.Verdict -eq "THROTTLED" }).Count
-    $dpi = @($rows | Where-Object { $_.Verdict -in @("DPI RESET", "DPI BLOCK") }).Count
-    $ipBlock = @($rows | Where-Object { $_.Verdict -eq "IP BLOCK" }).Count
-    $timeout = @($rows | Where-Object { $_.Verdict -eq "TIMEOUT" }).Count
-    $unknown = @($rows | Where-Object { $_.Verdict -eq "UNKNOWN" }).Count
+    if ($aborted -eq $rows) {
+        return [PSCustomObject]@{ Text = "STATUS: SCAN ABORTED"; Fg = "Black"; Bg = "Yellow" }
+    }
 
-    if ($available -eq $rows.Count) {
+    if ($available -eq $rows) {
         return [PSCustomObject]@{ Text = "SCAN RESULT: OK | $available HOSTS AVAILABLE"; Fg = "Black"; Bg = "Green" }
     }
 
@@ -2164,6 +2918,11 @@ function Get-IdleStatusMessage {
     if ($ipBlock -gt 0) { $parts += "$ipBlock IP BLOCK" }
     if ($timeout -gt 0) { $parts += "$timeout TIMEOUT" }
     if ($unknown -gt 0) { $parts += "$unknown UNKNOWN" }
+    if ($aborted -gt 0) { $parts += "$aborted ABORTED" }
+
+    if ($parts.Count -eq 0) {
+        return [PSCustomObject]@{ Text = "STATUS: ГОТОВ"; Fg = "Black"; Bg = "Green" }
+    }
 
     return [PSCustomObject]@{
         Text = "SCAN RESULT: DPI DETECTED | " + ($parts -join " | ")
@@ -2184,6 +2943,14 @@ function Draw-StatusBar {
     $feedbackRow = Get-FeedbackRow -count $script:Targets.Count
     $controlsRow = Get-ControlsRow -count $script:Targets.Count
     $width = [Console]::WindowWidth
+
+    # Full-width wipe when window width changes — kills green bar tails after resize.
+    if ($null -eq $script:StatusBarLayoutW -or $script:StatusBarLayoutW -ne $width) {
+        Out-Str 0 $feedbackRow (" " * $width) "Black" "Black"
+        Out-Str 0 $controlsRow (" " * $width) "Black" "Black"
+        Reset-StatusBarCache
+        $script:StatusBarLayoutW = $width
+    }
 
     $controlsText = ([string]$CONST.NavStr) -replace '^\[READY\]\s*', ''
     $navLine = " $controlsText "
@@ -2365,7 +3132,7 @@ function Draw-UI ($NetInfo, $Targets, $Results, $ClearScreen = $true) {
     } else {
         Out-Str $statusX0 $statusY (Format-CellLeft "> SYS STATUS: [ ONLINE ]" $rightW) "Green"
     }
-    Out-Str 65 2 (Format-CellLeft "> ENGINE: Barebuh Pro v3.1 / TUI v1.2" $rightW) "Red"
+    Out-Str 65 2 (Format-CellLeft "> ENGINE: Barebuh Pro v3.2 / TUI v1.5.3" $rightW) "Red"
     Out-Str 65 3 (Format-CellLeft ("> LOCAL DNS: " + $NetInfo.DNS) $rightW) "Cyan"
     Out-Str 65 4 (Format-CellLeft ("> CDN NODE: " + $NetInfo.CDN) $rightW) "Yellow"
     Out-Str 65 5 (Format-CellLeft "> AUTHOR: github.com/Shiperoid" $rightW) "Green"
@@ -2400,16 +3167,19 @@ function Draw-UI ($NetInfo, $Targets, $Results, $ClearScreen = $true) {
 
     Out-Str 0 ($y+2) ("=" * $width) "DarkCyan"
 
-
-    # Разделитель под заголовками
-    Out-Str 0 ($y+2) ("=" * $width) "DarkCyan"
-
     # Scale BEFORE rows — otherwise LatBarMaxMs stays 1 and every bar paints solid-full.
     try { if ($Results) { Update-LatBarScale -Results $Results } } catch { }
 
-    # Строки результатов
-    for($i=0; $i -lt $Targets.Count; $i++) {
-        $currentRow = $y + 3 + $i
+    $layout = Clamp-TableScroll -TargetCount $Targets.Count
+    $off = [int]$script:TableScrollOffset
+    $vis = [int]$layout.VisibleRows
+    $bodyStart = [int]$layout.TableBodyStart
+    $bottomRule = [int]$layout.BottomRuleRow
+
+    # Visible window of targets only (no full-body wipe — avoids flicker; cells are padded).
+    $endIdx = [Math]::Min($Targets.Count, $off + $vis) - 1
+    for ($i = $off; $i -le $endIdx; $i++) {
+        $currentRow = $bodyStart + ($i - $off)
         $num = $i + 1
         $numStr = Format-CellCenter $num.ToString() 4
 
@@ -2429,16 +3199,12 @@ function Draw-UI ($NetInfo, $Targets, $Results, $ClearScreen = $true) {
             Out-Str $httpStart $currentRow (Format-CellCenter $htStr $httpWidth) $hCol
 
             $t12Str = if ($res.T12) { [string]$res.T12 } else { "---" }
-            if (Get-Command Format-TlsCellDisplay -ErrorAction SilentlyContinue) {
-                $t12Str = Format-TlsCellDisplay -Cell $t12Str -RstPhase $res.RstPhase12
-            }
+            $t12Str = Format-TlsCellDisplay -Cell $t12Str -RstPhase $res.RstPhase12
             $t12Col = if($t12Str -eq "OK") {"Green"} elseif($t12Str -eq "N/A" -or $t12Str -eq "---") {"DarkGray"} else {"Red"}
             Out-Str $t12Start $currentRow (Format-CellCenter $t12Str $t12Width) $t12Col
 
             $t13Str = if ($res.T13) { [string]$res.T13 } else { "---" }
-            if (Get-Command Format-TlsCellDisplay -ErrorAction SilentlyContinue) {
-                $t13Str = Format-TlsCellDisplay -Cell $t13Str -RstPhase $res.RstPhase13
-            }
+            $t13Str = Format-TlsCellDisplay -Cell $t13Str -RstPhase $res.RstPhase13
             $t13Col = if($t13Str -eq "OK") {"Green"} elseif($t13Str -eq "N/A" -or $t13Str -eq "---") {"DarkGray"} else {"Red"}
             Out-Str $t13Start $currentRow (Format-CellCenter $t13Str $t13Width) $t13Col
 
@@ -2452,7 +3218,13 @@ function Draw-UI ($NetInfo, $Targets, $Results, $ClearScreen = $true) {
         }
     }
 
-    Out-Str 0 ($y + 3 + $Targets.Count) ("=" * $width) "DarkCyan"
+    # Bottom rule + scroll hint (never under NAV/STATUS).
+    Update-TableBottomScrollRule -Layout $layout
+    # Wipe any leftover lines between bottom rule and NAV (after shrink).
+    for ($cy = $bottomRule + 1; $cy -lt [int]$layout.NavRow; $cy++) {
+        Out-Str 0 $cy (" " * $width) "Black" "Black"
+    }
+
     [Console]::CursorVisible = $false
     Sync-DynamicColPosFromLayout
     Update-UiConsoleSnapshot
@@ -2466,13 +3238,33 @@ function Get-ScanAnim($f, $row) {
 
 function Write-ResultLine {
     param(
-        [int]$row,
+        [int]$row = -1,
         $result,
-        [switch]$IncludeStaticCells
+        [switch]$IncludeStaticCells,
+        [int]$TargetIndex = -1,
+        [switch]$TrustedBodyRow
     )
-    if ($row -lt 0 -or $row -ge [Console]::BufferHeight) { return }
+    if ($TargetIndex -ge 0) {
+        $row = Get-TableScreenRow -TargetIndex $TargetIndex
+    }
+    if ($row -lt 0) { return }
+    try {
+        if ($row -ge [Console]::WindowHeight) { return }
+    } catch {
+        if ($row -ge [Console]::BufferHeight) { return }
+    }
+    # Never paint into sticky footer (skip when caller already clipped to body).
+    if (-not $TrustedBodyRow) {
+        try {
+            $nav = Get-ControlsRow -count $(if ($script:Targets) { $script:Targets.Count } else { 0 })
+            if ($row -ge $nav) { return }
+        } catch { }
+    }
 
-    [Console]::CursorVisible = $false
+    if ($script:UiCursorHidden -ne $true) {
+        [Console]::CursorVisible = $false
+        $script:UiCursorHidden = $true
+    }
     $pos = if ($script:DynamicColPos) { $script:DynamicColPos } else { $CONST.UI }
     $ipWidth = if ($script:IpColumnWidth) { $script:IpColumnWidth } else { 16 }
 
@@ -2497,17 +3289,13 @@ function Write-ResultLine {
 
     # TLS 1.2
     $t12Str = if ($result.T12) { [string]$result.T12 } else { "---" }
-    if (Get-Command Format-TlsCellDisplay -ErrorAction SilentlyContinue) {
-        $t12Str = Format-TlsCellDisplay -Cell $t12Str -RstPhase $result.RstPhase12
-    }
+    $t12Str = Format-TlsCellDisplay -Cell $t12Str -RstPhase $result.RstPhase12
     $t12Col = if($t12Str -eq "OK") {"Green"} elseif($t12Str -eq "N/A" -or $t12Str -eq "---") {"DarkGray"} else {"Red"}
     Out-Str $pos.T12 $row (Format-CellCenter $t12Str 8) $t12Col
 
     # TLS 1.3
     $t13Str = if ($result.T13) { [string]$result.T13 } else { "---" }
-    if (Get-Command Format-TlsCellDisplay -ErrorAction SilentlyContinue) {
-        $t13Str = Format-TlsCellDisplay -Cell $t13Str -RstPhase $result.RstPhase13
-    }
+    $t13Str = Format-TlsCellDisplay -Cell $t13Str -RstPhase $result.RstPhase13
     $t13Col = if($t13Str -eq "OK") {"Green"} elseif($t13Str -eq "N/A" -or $t13Str -eq "---") {"DarkGray"} else {"Red"}
     Out-Str $pos.T13 $row (Format-CellCenter $t13Str 8) $t13Col
 
@@ -2528,10 +3316,20 @@ function Write-ResultLine {
     Out-Str $pos.Ver $row (Format-CellCenter $verStr 18) $result.Color
 }
 
-function Write-ResultLatency($row, $result) {
+function Write-ResultLatency($row, $result, [int]$TargetIndex = -1) {
+    if ($TargetIndex -ge 0) {
+        $row = Get-TableScreenRow -TargetIndex $TargetIndex
+    }
     if ($row -lt 0 -or $row -ge [Console]::BufferHeight) { return }
+    try {
+        $nav = Get-ControlsRow -count $(if ($script:Targets) { $script:Targets.Count } else { 0 })
+        if ($row -ge $nav) { return }
+    } catch { }
 
-    [Console]::CursorVisible = $false
+    if ($script:UiCursorHidden -ne $true) {
+        [Console]::CursorVisible = $false
+        $script:UiCursorHidden = $true
+    }
     $pos = if ($script:DynamicColPos) { $script:DynamicColPos } else { $CONST.UI }
     $latStr = if ($result.Lat) { [string]$result.Lat } else { "---" }
     $latCol = if($latStr -eq "---") {"DarkGray"} else {"Cyan"}
@@ -2598,6 +3396,9 @@ function Stop-Script {
     Start-Sleep -Milliseconds 200
 
     Write-DebugLog "--- СЕССИЯ ЗАВЕРШЕНА ---" "INFO"
+
+    try { Stop-DeferredPostScanExtras } catch { }
+    try { Close-ScanRunspacePool } catch { }
 
     # 3. Убиваем процесс
     [System.Diagnostics.Process]::GetCurrentProcess().Kill()
@@ -3218,12 +4019,6 @@ function Show-SettingsMenu {
         Write-Host "`n  7. Экспортировать текущие цели в targets.txt " -ForegroundColor White
         Write-Host "     (перезапишет файл, создаст при отсутствии; после экспорта ВКЛ автоматически)" -ForegroundColor Gray
 
-        $curBypassWarn = $true
-        if ($script:Config -and ($null -ne $script:Config.WarnBypassTools)) { $curBypassWarn = [bool]$script:Config.WarnBypassTools }
-        Write-Host "`n  8. Предупреждение о zapret/GoodbyeDPI " -NoNewline -ForegroundColor White
-        if ($curBypassWarn) { Write-Host "[ ВКЛ ]" -ForegroundColor Green } else { Write-Host "[ ВЫКЛ ]" -ForegroundColor DarkGray }
-        Write-Host "     Баннер и self-check процессов обхода при старте/скане." -ForegroundColor Gray
-
         $curLatBars = $true
         if ($script:Config -and ($null -ne $script:Config.UiShowLatBars)) { $curLatBars = [bool]$script:Config.UiShowLatBars }
         Write-Host "`n  9. LAT bars в таблице " -NoNewline -ForegroundColor White
@@ -3386,14 +4181,6 @@ function Show-SettingsMenu {
                     Write-Host "`n  [ОШИБКА] Не удалось записать файл: $($_.Exception.Message)" -ForegroundColor Red
                     Start-Sleep -Seconds 2
                 }
-            }
-            elseif ($key -eq "8") {
-                $next = -not $curBypassWarn
-                $script:Config | Add-Member -MemberType NoteProperty -Name "WarnBypassTools" -Value $next -Force
-                Save-Config $script:Config
-                $st8 = if ($next) { "ВКЛ" } else { "ВЫКЛ" }
-                Write-Host "`n  [OK] Предупреждение bypass-tools: $st8" -ForegroundColor Green
-                Start-Sleep -Seconds 1
             }
             elseif ($key -eq "9") {
                 $next = -not $curLatBars
@@ -4103,7 +4890,7 @@ function Show-HelpMenu {
                 Write-Host "   S         " -ForegroundColor Yellow -NoNewline; Write-Host " — настройки: IP (1), кэш (2), TLS (3), лог (4), полные идентификаторы в логе (5)." -ForegroundColor Gray
                 Write-Host "   P         " -ForegroundColor Yellow -NoNewline; Write-Host " — меню прокси (цифры 1–4 и история с 5, 0/Esc — выход)." -ForegroundColor Gray
                 Write-Host "   D         " -ForegroundColor Yellow -NoNewline; Write-Host " — DNS: системный резолв vs DoH." -ForegroundColor Gray
-                Write-Host "   G         " -ForegroundColor Yellow -NoNewline; Write-Host " — PATH: ICMP mtr-lite (hop/RTT sparkline) к домену или CDN." -ForegroundColor Gray
+                Write-Host "   G         " -ForegroundColor Yellow -NoNewline; Write-Host " — PATH: ICMP mtr-lite (без прокси/VPN; схлоп — экран)." -ForegroundColor Gray
                 Write-Host "   E         " -ForegroundColor Yellow -NoNewline; Write-Host " — EXTRA: полный блок DNS/QUIC/TCP16/IP-SNI + recommendations." -ForegroundColor Gray
                 Write-Host "   U         " -ForegroundColor Yellow -NoNewline; Write-Host " — проверка и загрузка обновления с GitHub." -ForegroundColor Gray
                 Write-Host "   R         " -ForegroundColor Yellow -NoNewline; Write-Host " — сохранить отчёт в файл YT-DPI_Report.txt (если скана не было — пустой шаблон)." -ForegroundColor Gray
@@ -4152,7 +4939,6 @@ function Show-HelpMenu {
                 Write-Host "`n [ EXTRA DIAG 3.0 (после ENTER) ]" -ForegroundColor White
                 Write-Host "   QUIC UDP:443, TCP 16–20KB drop, IP vs SNI (+ DNS тоже в EXTRA). Отдельный DNS-режим: клавиша D." -ForegroundColor Gray
                 Write-Host "   R → TXT + JSON. CLI: --batch [--json path] [--report path] [--no-extras]." -ForegroundColor Gray
-                Write-Host "   Выключите zapret/GoodbyeDPI/winws перед замером DPI провайдера." -ForegroundColor Yellow
 
                 Write-Host "`n [ КАК ЭТО ЧИТАТЬ ПРАКТИЧЕСКИ ]" -ForegroundColor White
                 Write-Host "   Сначала HTTP: если ERR — проблема шире TLS (маршрут, IP, прокси, «падает» порт 80)." -ForegroundColor Gray
@@ -4162,7 +4948,7 @@ function Show-HelpMenu {
             3 {
                 Write-Host "`n [ DNS (D) / PATH (G) / EXTRA (E) — UI 3.0 ]" -ForegroundColor White
                 Write-Host "   D — system DNS vs DoH для youtube/googlevideo/ytimg (+ CDN)." -ForegroundColor Gray
-                Write-Host "   G — PATH mtr-lite: ICMP TTL hops, loss/last/avg/best + sparkline. Esc отмена." -ForegroundColor Gray
+                Write-Host "   G — PATH mtr-lite: ICMP TTL hops. Не работает через прокси/VPN (отказ + пояснение)." -ForegroundColor Gray
                 Write-Host "   E — полный EXTRA DIAG и recommendations (скриншот)." -ForegroundColor Gray
                 Write-Host "`n   Подсказки после EXTRA — один раз в STATUS. Детали: [E]. Настройки: [S] 9 / A / B." -ForegroundColor Gray
                 Write-Host "   Deep Trace удалён; PATH не делает TLS на каждом хопе." -ForegroundColor DarkGray
@@ -4177,7 +4963,7 @@ function Show-HelpMenu {
                 Write-Host "   1 — IPv6 приоритет / только IPv4; 2 — сброс DNS и GEO-кэша; 3 — режим скана TLS (Auto / только 1.2 / только 1.3)." -ForegroundColor Gray
                 Write-Host "   4 — запись отладки в YT-DPI_Debug.log (рядом со скриптом); плюс можно включить через YT_DPI_DEBUG=1." -ForegroundColor Gray
                 Write-Host "   5 — полные ПК/пользователь/пути в заголовке лога (по умолчанию ВЫКЛ = обезличено); или YT_DPI_DEBUG_IDENTIFIERS=1." -ForegroundColor Gray
-                Write-Host "   6–7 — targets.txt; 8 — bypass warn; 9/A/B — LAT bars, charset, PATH params." -ForegroundColor Gray
+                Write-Host "   6–7 — targets.txt; 9/A/B — LAT bars, charset, PATH params." -ForegroundColor Gray
                 Write-Host "   Режим TLS и флаги отладки сохраняются в конфиг; лог активен, если ВКЛ в меню или задана переменная окружения." -ForegroundColor DarkGray
 
                 Write-Host "`n [ ОБНОВЛЕНИЕ (U) ]" -ForegroundColor White
@@ -4781,6 +5567,69 @@ function Test-ScanRowVisualChanged {
 # ====================================================================================
 # АСИНХРОННОЕ СКАНИРОВАНИЕ
 # ====================================================================================
+function Close-ScanRunspacePool {
+    if ($null -eq $script:ScanRunspacePool) {
+        $script:ScanRunspacePoolMax = 0
+        return
+    }
+    try { $script:ScanRunspacePool.Close() } catch { }
+    try { $script:ScanRunspacePool.Dispose() } catch { }
+    $script:ScanRunspacePool = $null
+    $script:ScanRunspacePoolMax = 0
+}
+
+function Ensure-ScanRunspacePool {
+    param([Parameter(Mandatory)][int]$MaxThreads)
+    if ($MaxThreads -lt 1) { $MaxThreads = 1 }
+    $needNew = $script:ScanRunspacePoolForceRecreate -or
+        ($null -eq $script:ScanRunspacePool) -or
+        ($script:ScanRunspacePoolMax -ne $MaxThreads)
+    if (-not $needNew) {
+        try {
+            if ($script:ScanRunspacePool.RunspacePoolStateInfo.State -ne [System.Management.Automation.Runspaces.RunspacePoolState]::Opened) {
+                $needNew = $true
+            }
+        } catch {
+            $needNew = $true
+        }
+    }
+    if ($needNew) {
+        Close-ScanRunspacePool
+        $script:ScanRunspacePoolForceRecreate = $false
+        $pool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
+        $pool.Open()
+        $script:ScanRunspacePool = $pool
+        $script:ScanRunspacePoolMax = $MaxThreads
+        Write-DebugLog "Scan RunspacePool created (max=$MaxThreads)" "INFO"
+    } else {
+        Write-DebugLog "Scan RunspacePool reused (max=$MaxThreads)" "DEBUG"
+    }
+    return $script:ScanRunspacePool
+}
+
+function Complete-ScanCollectJob {
+    param($Job, $Results)
+    if ($Job.DoneInBg) { return $false }
+    if (-not $Job.Handle.IsCompleted) { return $false }
+    try {
+        $raw = $Job.PowerShell.EndInvoke($Job.Handle)
+        $res = if ($raw.PSObject -and $raw.Count -gt 1) { $raw[0] } else { $raw }
+        $res | Add-Member -MemberType NoteProperty -Name "Number" -Value $Job.Number -Force
+        $Job.Result = $res
+        $Results[$Job.Index] = $res
+        $Job.DoneInBg = $true
+    } catch {
+        $fail = [PSCustomObject]@{
+            Target = $Job.Target; Number = $Job.Number; IP = "ERR"; HTTP = "---"
+            T12 = "---"; T13 = "---"; Lat = "---"; Verdict = "TIMEOUT"; Color = "Red"
+        }
+        $Job.Result = $fail
+        $Results[$Job.Index] = $fail
+        $Job.DoneInBg = $true
+    }
+    return $true
+}
+
 function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsVisible = $false) {
     Write-DebugLog "Start-ScanWithAnimation: сбор результатов + водопад (полный / по изменившимся строкам)"
     # Снимок предыдущего скана до перезаписи LastScanResults в вызывающем коде
@@ -4804,8 +5653,7 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
     $maxThreads = [Math]::Min($Targets.Count, $recommendedThreads)
     Write-DebugLog "Запуск пула потоков: $maxThreads воркеров (CPU=$cpuCount, proxy=$($ProxyConfig.Enabled))."
 
-    $pool = [runspacefactory]::CreateRunspacePool(1, $maxThreads)
-    $pool.Open()
+    $pool = Ensure-ScanRunspacePool -MaxThreads $maxThreads
     $jobs = [System.Collections.Generic.List[object]]::new()
     $results = New-Object 'object[]' $Targets.Count
     $completedTasks = 0
@@ -4828,17 +5676,21 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
         $ps.RunspacePool = $pool
         [void]$jobs.Add([PSCustomObject]@{
             PowerShell = $ps; Handle = $ps.BeginInvoke(); Index = $i; Number = $i + 1
-            Target = $Targets[$i]; DoneInBg = $false; Row = 12 + $i; Result = $null; Revealed = $false
+            Target = $Targets[$i]; DoneInBg = $false; Result = $null; Revealed = $false
         })
     }
 
-    # Первый скан рисует пустые строки. Повторный скан оставляет прошлые результаты до выборочного водопада.
+    # Первый скан рисует пустые строки только в видимом viewport. Повторный скан оставляет прошлые результаты.
     Sync-DynamicColPosFromLayout
+    $vpInit = Get-TableViewportIndexRange -TargetCount $Targets.Count
     if ($useFullWaterfall -and -not $PlaceholderRowsVisible) {
-        foreach ($jb in $jobs) {
+        for ($pi = [int]$vpInit.StartIdx; $pi -le [int]$vpInit.EndIdx; $pi++) {
+            $jb = $jobs[$pi]
             $ph = New-PlaceholderResultRow -Number $jb.Number -Target $jb.Target
-            Write-ResultLine $jb.Row $ph
+            $screenRow = [int]$vpInit.Layout.TableBodyStart + ($pi - [int]$vpInit.StartIdx)
+            Write-ResultLine -row $screenRow -result $ph
         }
+        Update-TableBottomScrollRule -Layout $vpInit.Layout
     }
     try {
         $script:ScanLayoutSnapW = [Console]::WindowWidth
@@ -4847,6 +5699,7 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
         $script:ScanLayoutSnapW = $null
         $script:ScanLayoutSnapH = $null
     }
+    $script:ResizePendingSince = $null
 
     $aborted = $false
     $frameCounter = 0
@@ -4867,7 +5720,8 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
         $pctScan = $completedTasks / [double]$tcScan
         $resizedScan = Test-ScanPhaseConsoleLayoutChanged
         $nowBar = [Environment]::TickCount64
-        $bucketScan = [int]($pctScan * 40)
+        # 10% progress buckets (was *40 = ~2.5%) — fewer status writes
+        $bucketScan = [int]($pctScan * 10)
         if ($resizedScan -or ($completedTasks -ne $scanBarLastDone) -or (($nowBar - $scanBarLastMs) -ge $uiThrottleCollect) -or ($bucketScan -ne $scanBarLastBucket)) {
             $scanBarLastMs = $nowBar
             $scanBarLastDone = $completedTasks
@@ -4876,32 +5730,98 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
         }
 
         if ([Console]::KeyAvailable) {
-            if ([Console]::ReadKey($true).Key -in @("Q", "Escape")) {
+            $sk = [Console]::ReadKey($true).Key
+            if ($sk -in @("Q", "Escape")) {
                 [Console]::CursorVisible = $false
                 try { [Console]::CursorSize = 1 } catch { }
                 $aborted = $true; break
             }
-        }
-
-        foreach ($j in $jobs) {
-            if (-not $j.DoneInBg -and $j.Handle.IsCompleted) {
-                try {
-                    $raw = $j.PowerShell.EndInvoke($j.Handle)
-                    $res = if ($raw.PSObject -and $raw.Count -gt 1) { $raw[0] } else { $raw }
-                    $res | Add-Member -MemberType NoteProperty -Name "Number" -Value $j.Number -Force
-                    $j.Result = $res; $results[$j.Index] = $res; $j.DoneInBg = $true; $completedTasks++
-                } catch { $j.DoneInBg = $true; $completedTasks++ }
+            elseif (Invoke-CoalescedTableScroll -FirstKey $sk -Results $results) {
+                # viewport already painted once after key coalesce
             }
         }
 
+        foreach ($j in $jobs) {
+            if (Complete-ScanCollectJob -Job $j -Results $results) { $completedTasks++ }
+        }
+
         if ($completedTasks -ge $Targets.Count) { break }
-        $sleepMs = $animTargetMs - $frameSw.Elapsed.TotalMilliseconds
-        if ($sleepMs -gt 0.5) { [System.Threading.Thread]::Sleep([int][math]::Floor($sleepMs)) }
+
+        $waitMs = [int][math]::Floor($animTargetMs - $frameSw.Elapsed.TotalMilliseconds)
+        if ($waitMs -lt 0) { $waitMs = 0 }
+        $pendingHandles = New-Object System.Collections.Generic.List[System.Threading.WaitHandle]
+        foreach ($j in $jobs) {
+            if (-not $j.DoneInBg -and $j.Handle) {
+                try { [void]$pendingHandles.Add($j.Handle.AsyncWaitHandle) } catch { }
+            }
+        }
+        if ($pendingHandles.Count -eq 1) {
+            [void]$pendingHandles[0].WaitOne($waitMs)
+        } elseif ($pendingHandles.Count -gt 1) {
+            $arr = $pendingHandles.ToArray()
+            if ($arr.Length -gt 63) {
+                $chunk = New-Object System.Threading.WaitHandle[] 63
+                [Array]::Copy($arr, $chunk, 63)
+                [void][System.Threading.WaitHandle]::WaitAny($chunk, $waitMs)
+            } else {
+                [void][System.Threading.WaitHandle]::WaitAny($arr, $waitMs)
+            }
+        } elseif ($waitMs -gt 0) {
+            [System.Threading.Thread]::Sleep($waitMs)
+        }
         $frameSw.Restart()
     }
 
-    $pool.Close(); $pool.Dispose()
+    # Stop incomplete workers on abort so runspaces return to the shared pool.
+    if ($aborted) {
+        foreach ($j in $jobs) {
+            if (-not $j.DoneInBg) {
+                try { $j.PowerShell.Stop() } catch { $script:ScanRunspacePoolForceRecreate = $true }
+                try {
+                    if ($j.Handle) { $null = $j.PowerShell.EndInvoke($j.Handle) }
+                } catch { }
+                $j.DoneInBg = $true
+            }
+        }
+    }
     foreach ($j in $jobs) { try { $j.PowerShell.Dispose() } catch {} }
+
+    $commitResults = $true
+    $returnResults = $results
+
+    # --- Abort: never commit null/IDLE holes over a good prior scan ---
+    if ($aborted) {
+        if ($script:HasCompletedScan -and $prevSnap) {
+            Write-DebugLog "Scan aborted — keeping previous LastScanResults" "INFO"
+            $commitResults = $false
+            $returnResults = $prevSnap
+            # Repaint visible viewport so screen matches committed data
+            $vpAbort = Get-TableViewportIndexRange -TargetCount $prevSnap.Count
+            for ($ai = [int]$vpAbort.StartIdx; $ai -le [int]$vpAbort.EndIdx; $ai++) {
+                if ($prevSnap[$ai]) {
+                    $screenRow = [int]$vpAbort.Layout.TableBodyStart + ($ai - [int]$vpAbort.StartIdx)
+                    Write-ResultLine -row $screenRow -result $prevSnap[$ai]
+                }
+            }
+            Update-TableBottomScrollRule -Layout $vpAbort.Layout
+        } else {
+            Write-DebugLog "Scan aborted — filling unfinished rows as SCAN ABORTED" "INFO"
+            for ($ai = 0; $ai -lt $Targets.Count; $ai++) {
+                if ($null -eq $results[$ai]) {
+                    $results[$ai] = New-AbortedResultRow -Number ($ai + 1) -Target $Targets[$ai]
+                }
+            }
+            $vpAbort = Get-TableViewportIndexRange -TargetCount $Targets.Count
+            for ($ai = [int]$vpAbort.StartIdx; $ai -le [int]$vpAbort.EndIdx; $ai++) {
+                $screenRow = [int]$vpAbort.Layout.TableBodyStart + ($ai - [int]$vpAbort.StartIdx)
+                Write-ResultLine -row $screenRow -result $results[$ai]
+            }
+            Update-TableBottomScrollRule -Layout $vpAbort.Layout
+            $returnResults = $results
+            $commitResults = $true
+        }
+        Draw-StatusBar -Message "[ ABORTED ] Скан прерван" -Fg "Black" -Bg "Red"
+    }
 
     # --- ЭТАП 2: «водопад» — первый успешный проход полностью; дальше только задержка на изменившихся строках ---
     if (-not $aborted) {
@@ -4917,7 +5837,6 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
         $animTargetMs = 1000.0 / $revealFps
         $frameSw.Restart()
         $revealBarLastMs = [Environment]::TickCount64
-        $revealBarLastI = -9999
         $revealBarLastBucket = -9999
         $uiThrottleReveal = if ($CONST.UiScan -and $null -ne $CONST.UiScan.StatusBarThrottleRevealMs) { [int]$CONST.UiScan.StatusBarThrottleRevealMs } else { 280 }
         # Scale LAT bars before first Write-ResultLine (default LatBarMaxMs=1 made every bar solid).
@@ -4929,10 +5848,9 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
             $pctReveal = ($i + 1) / [double][Math]::Max(1, $totalCount)
             $resizedReveal = Test-ScanPhaseConsoleLayoutChanged
             $nowRv = [Environment]::TickCount64
-            $bucketRv = [int]($pctReveal * 40)
-            if ($resizedReveal -or ($i -ne $revealBarLastI) -or (($nowRv - $revealBarLastMs) -ge $uiThrottleReveal) -or ($bucketRv -ne $revealBarLastBucket)) {
+            $bucketRv = [int]($pctReveal * 10)
+            if ($resizedReveal -or (($nowRv - $revealBarLastMs) -ge $uiThrottleReveal) -or ($bucketRv -ne $revealBarLastBucket)) {
                 $revealBarLastMs = $nowRv
-                $revealBarLastI = $i
                 $revealBarLastBucket = $bucketRv
                 Invoke-ScanRedrawIfConsoleResized -LiveResults $results -Targets $Targets -StatusBarMessage "[ SCAN ] Раскрытие: $($i+1) / $totalCount" -Progress $pctReveal
             }
@@ -4953,23 +5871,36 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
                 $rowChanged = Test-ScanRowVisualChanged -OldRow $prevSnap[$i] -NewRow $res
             }
 
-            if ($useFullWaterfall -or $rowChanged) {
-                Write-ResultLine $j.Row $res
-                $sleepMs = $animTargetMs - $frameSw.Elapsed.TotalMilliseconds
-                if ($sleepMs -gt 0.5) { [System.Threading.Thread]::Sleep([int][math]::Floor($sleepMs)) }
+            $screenRow = Get-TableScreenRow -TargetIndex $i -TargetCount $totalCount
+            if ($screenRow -ge 0) {
+                if ($useFullWaterfall -or $rowChanged) {
+                    Write-ResultLine -row $screenRow -result $res
+                    $sleepMs = $animTargetMs - $frameSw.Elapsed.TotalMilliseconds
+                    if ($sleepMs -gt 0.5) { [System.Threading.Thread]::Sleep([int][math]::Floor($sleepMs)) }
+                }
+                else {
+                    Write-ResultLatency -row $screenRow -result $res
+                }
+                $frameSw.Restart()
             }
-            else {
-                Write-ResultLatency $j.Row $res
+
+            if ([Console]::KeyAvailable) {
+                $rk = [Console]::ReadKey($true).Key
+                if ($rk -in @("Q", "Escape")) { break }
+                elseif (Invoke-CoalescedTableScroll -FirstKey $rk -Results $results) {
+                    # viewport already painted once after key coalesce
+                }
             }
-            $frameSw.Restart()
         }
 
         $script:HasCompletedScan = $true
+        $returnResults = $results
+        $commitResults = $true
         Draw-StatusBar
     }
 
-    # Обновляем NetInfo только при необходимости
-
+    # Обновляем NetInfo только при необходимости (skip on abort to return to Idle faster)
+    if (-not $aborted) {
     $currentISP = $script:NetInfo.ISP
     $currentLOC = $script:NetInfo.LOC
     $cacheAge = (Get-Date).Ticks - $script:NetInfo.TimestampTicks
@@ -4990,29 +5921,8 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
     }
 
     if ($needUpdate) {
-        Write-DebugLog "Запуск синхронного обновления NetInfo..."
-        Draw-StatusBar -Message "[ NET ] Обновление информации о сети..." -Fg "Black" -Bg "Cyan"
-
-        $newNetInfo = Get-NetworkInfo
-
-        # Проверяем, что новое значение не хуже старого
-        if ($newNetInfo.ISP -ne "Unknown" -and $newNetInfo.ISP -ne "Loading...") {
-            $script:NetInfo = $newNetInfo
-            $null = Set-NetInfoCacheIfUsable $newNetInfo
-            Save-Config $script:Config
-
-            # Обновляем только строку с ISP в UI (без полной перерисовки)
-            $ispStr = "> ISP / LOC: $($newNetInfo.ISP) ($($newNetInfo.LOC))"
-            if ($ispStr.Length -gt 70) { $ispStr = $ispStr.Substring(0, 67) + "..." }
-            [Console]::CursorVisible = $false
-            Out-Str 65 6 ($ispStr.PadRight(70)) "Magenta"
-
-            Write-DebugLog "NetInfo обновлён: ISP=$($newNetInfo.ISP), LOC=$($newNetInfo.LOC)"
-        } else {
-            Write-DebugLog "Новые данные не лучше старых, оставляем текущий ISP: $currentISP"
-        }
-
-        Draw-StatusBar
+        Write-DebugLog "NetInfo needs refresh — starting background updater (non-blocking)" "INFO"
+        Start-BackgroundNetInfoUpdate
     } else {
         Write-DebugLog "NetInfo актуален, пропускаем обновление (ISP=$currentISP, возраст=${ageMinutes} мин)"
     }
@@ -5020,7 +5930,7 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
     # Ложный IPv6: только если скан завершён полностью и каждая строка — IP BLOCK или UNKNOWN
     $resolved = @($results | Where-Object { $_ })
     $nonIpBlock = @($resolved | Where-Object { $_.Verdict -ne "IP BLOCK" -and $_.Verdict -ne "UNKNOWN" })
-    $allIpBlock = (-not $aborted) -and ($resolved.Count -gt 0) -and ($resolved.Count -eq $results.Count) -and ($nonIpBlock.Count -eq 0)
+    $allIpBlock = ($resolved.Count -gt 0) -and ($resolved.Count -eq $results.Count) -and ($nonIpBlock.Count -eq 0)
     if ($allIpBlock -and $script:NetInfo.HasIPv6 -eq $true) {
         Write-DebugLog "Все тесты дали IP BLOCK, но HasIPv6=true. Переключаем HasIPv6 в false." "WARN"
         $script:NetInfo.HasIPv6 = $false
@@ -5039,16 +5949,22 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
     # Обновляем ширину IP колонки на основе реальных результатов
     if ($results) {
         $maxIp = ($results | ForEach-Object {
-            if ($_.IP -and $_.IP -ne "[ PROXIED ]") { $_.IP.Length } else { 16 }
+            if ($_ -and $_.IP -and $_.IP -ne "[ PROXIED ]") { $_.IP.Length } else { 16 }
         } | Measure-Object -Maximum).Maximum
         $script:IpColumnWidth = [Math]::Max($maxIp, 16)
     }
+    } # end -not $aborted NetInfo block
 
     Sync-DynamicColPosFromLayout
     $script:ScanLayoutSnapW = $null
     $script:ScanLayoutSnapH = $null
+    $script:ResizePendingSince = $null
     Update-UiConsoleSnapshot
-    return [PSCustomObject]@{ Results = $results; Aborted = $aborted }
+    return [PSCustomObject]@{
+        Results = $returnResults
+        Aborted = $aborted
+        CommitResults = $commitResults
+    }
 }
 
 function Sync-DnsCacheFromConfig {
@@ -5252,6 +6168,10 @@ function Update-TargetsBeforeScan {
     $NeedClear = ($NewTargets.Count -ne $script:Targets.Count)
     $NeedTableRefresh = $NeedClear -or ($oldTargetsKey -ne $newTargetsKey)
     $script:Targets = $NewTargets
+    if ($NeedTableRefresh) {
+        $script:TableScrollOffset = 0
+        $null = Clamp-TableScroll -TargetCount $script:Targets.Count
+    }
 
     # Сохраняем предыдущие результаты на экране до старта сбора (строки «обнулятся» внутри Start-Scan)
     $rowsBeforeScan = if (-not $NeedTableRefresh -and $script:LastScanResults -and $script:LastScanResults.Count -eq $script:Targets.Count) {
@@ -5384,53 +6304,190 @@ function Invoke-DnsScanAction {
 # ====================================================================================
 
 function Test-WarnBypassToolsEnabled {
-    try {
-        if ($script:Config -and ($null -ne $script:Config.WarnBypassTools)) {
-            return [bool]$script:Config.WarnBypassTools
-        }
-    } catch { }
-    return $true
+    # Bypass tools are a normal way to verify results — never warn about them.
+    return $false
 }
 
 function Invoke-BypassToolsSelfCheck {
-    $names = @()
-    try {
-        $want = @($CONST.BypassProcessNames | ForEach-Object { [string]$_ })
-        $procs = Get-Process -ErrorAction SilentlyContinue
-        foreach ($p in $procs) {
-            $n = [string]$p.ProcessName
-            foreach ($w in $want) {
-                if ($n -like "*$w*" -or $n -eq $w) {
-                    if ($names -notcontains $n) { $names += $n }
-                }
-            }
-        }
-    } catch {
-        Write-DebugLog "Bypass self-check error: $_" "WARN"
-    }
-    $detected = ($names.Count -gt 0)
-    $script:ExtraDiag.BypassTools = @{ Detected = $detected; Names = @($names) }
-    Write-DebugLog ("Bypass tools detected={0} names=[{1}]" -f $detected, ($names -join ", ")) "INFO"
+    # Kept for smoke/JSON compatibility; no UI warnings.
+    $script:ExtraDiag.BypassTools = @{ Detected = $false; Names = @() }
     return $script:ExtraDiag.BypassTools
 }
 
 function Show-BypassWarningBanner {
-    if (-not (Test-WarnBypassToolsEnabled)) { return }
-    $check = Invoke-BypassToolsSelfCheck
-    $msg = "[ WARN ] For accurate DPI results, disable zapret / GoodbyeDPI / winws / ByeDPI before scanning."
-    if ($check.Detected) {
-        $msg = "[ WARN ] Bypass tools running: $($check.Names -join ', '). Results may be skewed - disable them."
+    return
+}
+
+function Complete-PostScanExtrasFinalize {
+    $rstCh = 0; $rstPost = 0
+    if ($script:LastScanResults) {
+        foreach ($r in @($script:LastScanResults)) {
+            if (-not $r) { continue }
+            foreach ($ph in @($r.RstPhase12, $r.RstPhase13)) {
+                if ($ph -eq "RST_CH") { $rstCh++ }
+                elseif ($ph -eq "RST_POST") { $rstPost++ }
+            }
+        }
     }
-    if ($script:BatchMode) {
-        Write-Host $msg
+    $script:ExtraDiag.RstStats = @{ RstCh = $rstCh; RstPost = $rstPost }
+    Build-Recommendations -ScanRows $script:LastScanResults -Extra $script:ExtraDiag | Out-Null
+    try { Update-LatBarScale -Results $script:LastScanResults } catch { }
+}
+
+function Invoke-PostScanExtrasBody {
+    # Runs in extras runspace (or sync batch). Mutates $script:ExtraDiag; returns snapshot.
+    try { Invoke-DnsCompareProbe | Out-Null } catch { Write-DebugLog "DNS probe: $_" "WARN" }
+    try { Invoke-QuicUdpProbe | Out-Null } catch { Write-DebugLog "QUIC probe: $_" "WARN" }
+    try { Invoke-Tcp16Probe | Out-Null } catch { Write-DebugLog "TCP16 probe: $_" "WARN" }
+    try { Invoke-IpVsSniProbe | Out-Null } catch { Write-DebugLog "IpVsSni probe: $_" "WARN" }
+    return [PSCustomObject]@{
+        Dns    = $script:ExtraDiag.Dns
+        Quic   = $script:ExtraDiag.Quic
+        Tcp16  = $script:ExtraDiag.Tcp16
+        IpVsSni = $script:ExtraDiag.IpVsSni
+    }
+}
+
+function Stop-DeferredPostScanExtras {
+    $ps = $script:ExtrasPs
+    $handle = $script:ExtrasHandle
+    $rs = $script:ExtrasRunspace
+    $script:ExtrasPs = $null
+    $script:ExtrasHandle = $null
+    $script:ExtrasRunspace = $null
+    $script:ExtrasPending = $false
+    $script:ExtrasStep = 0
+    if ($null -eq $ps) {
+        if ($rs) { try { $rs.Close() } catch { }; try { $rs.Dispose() } catch { } }
         return
     }
     try {
-        Draw-StatusBar -Message $msg -Fg "Black" -Bg "Yellow"
-        Start-Sleep -Seconds 2
-    } catch {
-        Write-Host $msg -ForegroundColor Yellow
+        if ($handle -and -not $handle.IsCompleted) { $ps.Stop() }
+    } catch { }
+    try {
+        if ($handle) { $null = $ps.EndInvoke($handle) }
+    } catch { }
+    try { $ps.Dispose() } catch { }
+    if ($rs) {
+        try { $rs.Close() } catch { }
+        try { $rs.Dispose() } catch { }
     }
+}
+
+function Start-DeferredPostScanExtras {
+    if ($script:NoExtras -or $script:BatchMode) {
+        $script:ExtrasStep = 0
+        $script:ExtrasPending = $false
+        return
+    }
+    Stop-DeferredPostScanExtras
+    $null = Ensure-TlsScannerLoaded
+
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $fnNames = @(
+        'Write-DebugLog',
+        'Test-DebugLogEnabled',
+        'Invoke-DnsCompareProbe',
+        'Invoke-QuicUdpProbe',
+        'New-QuicInitialProbeBytes',
+        'Invoke-Tcp16Probe',
+        'Invoke-IpVsSniProbe',
+        'Ensure-TlsScannerLoaded',
+        'Test-TlsScannerReady',
+        'Invoke-PostScanExtrasBody'
+    )
+    foreach ($n in $fnNames) {
+        $cmd = Get-Command -Name $n -CommandType Function -ErrorAction SilentlyContinue
+        if ($cmd) {
+            [void]$iss.Commands.Add(
+                (New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($n, $cmd.Definition))
+            )
+        }
+    }
+    $varType = [System.Management.Automation.Runspaces.SessionStateVariableEntry]
+    [void]$iss.Variables.Add((New-Object $varType('CONST', $CONST, $null)))
+    [void]$iss.Variables.Add((New-Object $varType('DebugLogFile', $DebugLogFile, $null)))
+    [void]$iss.Variables.Add((New-Object $varType('DEBUG_ENABLED', [bool]$DEBUG_ENABLED, $null)))
+    [void]$iss.Variables.Add((New-Object $varType('DebugLogMutex', $DebugLogMutex, $null)))
+    if (Get-Variable -Name tlsCode -Scope Script -ErrorAction SilentlyContinue) {
+        [void]$iss.Variables.Add((New-Object $varType('tlsCode', $tlsCode, $null)))
+    } elseif (Get-Variable -Name tlsCode -ErrorAction SilentlyContinue) {
+        [void]$iss.Variables.Add((New-Object $varType('tlsCode', (Get-Variable tlsCode).Value, $null)))
+    }
+
+    $rs = [runspacefactory]::CreateRunspace($iss)
+    $rs.Open()
+    $ps = [PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript({
+        param($NetInfoObj, $ConfigObj)
+        $script:NetInfo = $NetInfoObj
+        $script:Config = $ConfigObj
+        $script:ExtraDiag = [ordered]@{
+            BypassTools     = @{ Detected = $false; Names = @() }
+            Dns             = @()
+            Quic            = $null
+            Tcp16           = $null
+            IpVsSni         = $null
+            RstStats        = @{ RstCh = 0; RstPost = 0 }
+            Recommendations = @()
+        }
+        $script:TlsScannerLoaded = $true
+        $script:TlsScannerLoadFailed = $false
+        Invoke-PostScanExtrasBody
+    }).AddArgument($script:NetInfo).AddArgument($script:Config)
+
+    $script:ExtrasRunspace = $rs
+    $script:ExtrasPs = $ps
+    $script:ExtrasHandle = $ps.BeginInvoke()
+    $script:ExtrasPending = $true
+    $script:ExtrasStep = 1
+    Write-DebugLog "EXTRA started async (in-process runspace)" "INFO"
+}
+
+function Update-ExtrasFromCompletedAsync {
+    if (-not $script:ExtrasPending) { return $false }
+    $ps = $script:ExtrasPs
+    $handle = $script:ExtrasHandle
+    if ($null -eq $ps -or $null -eq $handle) {
+        $script:ExtrasPending = $false
+        $script:ExtrasStep = 0
+        return $false
+    }
+    if (-not $handle.IsCompleted) { return $false }
+
+    $snap = $null
+    try {
+        $raw = $ps.EndInvoke($handle)
+        $snap = if ($raw -is [System.Array] -and $raw.Count -gt 0) { $raw[0] } else { $raw }
+    } catch {
+        Write-DebugLog "EXTRA async EndInvoke: $_" "WARN"
+    }
+    try { $ps.Dispose() } catch { }
+    if ($script:ExtrasRunspace) {
+        try { $script:ExtrasRunspace.Close() } catch { }
+        try { $script:ExtrasRunspace.Dispose() } catch { }
+    }
+    $script:ExtrasPs = $null
+    $script:ExtrasHandle = $null
+    $script:ExtrasRunspace = $null
+    $script:ExtrasPending = $false
+    $script:ExtrasStep = 0
+
+    if ($snap) {
+        try {
+            if ($null -ne $snap.Dns) { $script:ExtraDiag.Dns = $snap.Dns }
+            if ($null -ne $snap.Quic) { $script:ExtraDiag.Quic = $snap.Quic }
+            if ($null -ne $snap.Tcp16) { $script:ExtraDiag.Tcp16 = $snap.Tcp16 }
+            if ($null -ne $snap.IpVsSni) { $script:ExtraDiag.IpVsSni = $snap.IpVsSni }
+        } catch {
+            Write-DebugLog "EXTRA merge: $_" "WARN"
+        }
+    }
+    try { Complete-PostScanExtrasFinalize } catch { Write-DebugLog "EXTRA finalize: $_" "WARN" }
+    try { Draw-StatusBar } catch { }
+    Write-DebugLog "EXTRA async completed" "INFO"
+    return $true
 }
 
 function Get-RstPhaseFromException {
@@ -5712,9 +6769,6 @@ function Invoke-IpVsSniProbe {
 function Build-Recommendations {
     param($ScanRows, $Extra)
     $recs = New-Object System.Collections.Generic.List[string]
-    if ($Extra.BypassTools -and $Extra.BypassTools.Detected) {
-        [void]$recs.Add("Bypass tools detected ($($Extra.BypassTools.Names -join ', ')): re-run with them disabled for accurate ISP DPI picture.")
-    }
     $dpi = 0; $thr = 0; $ipb = 0; $rstCh = 0
     if ($ScanRows) {
         foreach ($r in @($ScanRows)) {
@@ -5732,45 +6786,48 @@ function Build-Recommendations {
         $rstCh = [Math]::Max($rstCh, [int]$Extra.RstStats.RstCh)
     }
     if ($rstCh -gt 0) {
-        [void]$recs.Add("RST during ClientHello (RST_CH) on some hosts: classic SNI/DPI injection - TLS path is actively reset.")
+        [void]$recs.Add("RST во время ClientHello (RST_CH) на части хостов: классическая инъекция SNI/DPI — TLS-путь активно сбрасывается.")
     }
     if ($thr -gt 0) {
-        [void]$recs.Add("THROTTLED rows: one TLS version works, the other fails - try forcing TLS 1.2 in clients or disable HTTP/3 quirks.")
+        [void]$recs.Add("Строки THROTTLED: одна версия TLS работает, другая нет — попробуйте принудительный TLS 1.2 в клиентах или отключите особенности HTTP/3.")
     }
     if ($dpi -gt 0) {
-        [void]$recs.Add("DPI RESET/BLOCK on YouTube targets: ISP filter likely inspects SNI; compare with proxy scan (P).")
+        [void]$recs.Add("DPI RESET/BLOCK на целях YouTube: похоже, фильтр провайдера смотрит SNI; сравните со сканом через прокси (P).")
     }
     if ($ipb -gt 0 -and $ipb -eq @($ScanRows | Where-Object { $_ }).Count) {
-        [void]$recs.Add("All IP BLOCK: check base connectivity/DNS before assuming DPI.")
+        [void]$recs.Add("Везде IP BLOCK: сначала проверьте базовую связность/DNS, прежде чем списывать на DPI.")
     }
     if ($Extra.Dns) {
         $bad = @($Extra.Dns | Where-Object { $_.Status -ne "OK" })
         if ($bad.Count -gt 0) {
-            [void]$recs.Add("DNS issues ($(($bad | ForEach-Object { $_.Host + '=' + $_.Status }) -join '; ')): try DoH/trusted resolver or fix system DNS.")
+            [void]$recs.Add("Проблемы DNS ($(($bad | ForEach-Object { $_.Host + '=' + $_.Status }) -join '; ')): попробуйте DoH/доверенный резолвер или поправьте системный DNS.")
         }
     }
     if ($Extra.Quic -and $Extra.Quic.Summary -eq "QUIC_BLOCK") {
-        [void]$recs.Add("QUIC/UDP:443 looks blocked: disable HTTP/3 in the browser so YouTube falls back to TCP/TLS.")
+        [void]$recs.Add("QUIC/UDP:443 похоже заблокирован: отключите HTTP/3 в браузере, чтобы YouTube ушёл на TCP/TLS.")
     }
     if ($Extra.Tcp16 -and $Extra.Tcp16.Status -eq "TCP16_DROP") {
-        [void]$recs.Add("TCP 16-20KB drop on CDN: bulk transfers stall after handshake - typical TSPU CDN pattern.")
+        [void]$recs.Add("Обрыв TCP на 16–20 КБ у CDN: после handshake большой объём рвётся — типичный паттерн ТСПУ на CDN.")
     }
     if ($Extra.IpVsSni) {
         switch ($Extra.IpVsSni.Status) {
-            "IP_BLOCK" { [void]$recs.Add("IP-level block on CDN address: SNI change alone will not help - need different route/proxy.") }
-            "SNI_BLOCK" { [void]$recs.Add("SNI-based block (YouTube SNI fails, control SNI differs): DPI by name, not pure IP ban.") }
+            "IP_BLOCK" { [void]$recs.Add("Блокировка по адресу IP CDN: смена SNI не поможет — нужен другой маршрут/прокси.") }
+            "SNI_BLOCK" { [void]$recs.Add("Блокировка по SNI (YouTube SNI падает, контрольный отличается): DPI по имени, не чистый IP-бан.") }
         }
     }
     if ($recs.Count -eq 0) {
-        [void]$recs.Add("No major DPI/DNS/QUIC anomalies in extra suite - if YouTube still lags, check CDN/buffering and browser HTTP/3.")
+        [void]$recs.Add("Крупных аномалий DPI/DNS/QUIC в доп. наборе нет — если YouTube всё ещё тормозит, проверьте CDN/буферизацию и HTTP/3 в браузере.")
     }
     $script:ExtraDiag.Recommendations = @($recs)
     return @($recs)
 }
 
 function Invoke-PostScanExtras {
+    # Batch / sync path: run all probes; no STATUS tip (tips live under [E] only).
     if ($script:NoExtras) {
         Write-DebugLog "EXTRA skipped (--no-extras)" "INFO"
+        $script:ExtrasStep = 0
+        $script:ExtrasPending = $false
         return
     }
     if (-not $script:BatchMode) {
@@ -5778,33 +6835,11 @@ function Invoke-PostScanExtras {
     } else {
         Write-Host "[ EXTRA ] Running DNS / QUIC / TCP16 / IP-vs-SNI..."
     }
-    try { Invoke-DnsCompareProbe | Out-Null } catch { Write-DebugLog "DNS probe: $_" "WARN" }
-    try { Invoke-QuicUdpProbe | Out-Null } catch { Write-DebugLog "QUIC probe: $_" "WARN" }
-    try { Invoke-Tcp16Probe | Out-Null } catch { Write-DebugLog "TCP16 probe: $_" "WARN" }
-    try { Invoke-IpVsSniProbe | Out-Null } catch { Write-DebugLog "IpVsSni probe: $_" "WARN" }
-
-    $rstCh = 0; $rstPost = 0
-    if ($script:LastScanResults) {
-        foreach ($r in @($script:LastScanResults)) {
-            if (-not $r) { continue }
-            foreach ($ph in @($r.RstPhase12, $r.RstPhase13)) {
-                if ($ph -eq "RST_CH") { $rstCh++ }
-                elseif ($ph -eq "RST_POST") { $rstPost++ }
-            }
-        }
-    }
-    $script:ExtraDiag.RstStats = @{ RstCh = $rstCh; RstPost = $rstPost }
-    Build-Recommendations -ScanRows $script:LastScanResults -Extra $script:ExtraDiag | Out-Null
-    try { Update-LatBarScale -Results $script:LastScanResults } catch { }
-
+    try { Invoke-PostScanExtrasBody | Out-Null } catch { Write-DebugLog "EXTRA body: $_" "WARN" }
+    Complete-PostScanExtrasFinalize
+    $script:ExtrasStep = 0
+    $script:ExtrasPending = $false
     if (-not $script:BatchMode) {
-        # One-shot tip on STATUS only — never a third panel, never spam/loop.
-        if ($script:ExtraDiag.Recommendations -and @($script:ExtraDiag.Recommendations).Count -gt 0) {
-            $brief = [string](@($script:ExtraDiag.Recommendations)[0])
-            if ($brief.Length -gt 90) { $brief = $brief.Substring(0, 87) + "..." }
-            Draw-StatusBar -Message "[ TIP ] $brief" -Fg "Black" -Bg "DarkYellow"
-            Start-Sleep -Milliseconds 1200
-        }
         Draw-StatusBar
     }
 }
@@ -5876,40 +6911,45 @@ function Export-YtDpiJsonReport {
 function Format-ExtraDiagText {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("=== BYPASS WARN ===")
-    $bt = $script:ExtraDiag.BypassTools
-    if ($bt -and $bt.Detected) {
-        [void]$sb.AppendLine(("Detected: {0}" -f ($bt.Names -join ", ")))
-    } else {
-        [void]$sb.AppendLine("No known bypass processes detected (still disable zapret/GoodbyeDPI manually if used).")
-    }
-    [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("=== EXTRA DIAG ===")
+    [void]$sb.AppendLine("=== ДОП. ДИАГНОСТИКА ===")
     if ($script:ExtraDiag.Dns) {
-        [void]$sb.AppendLine("DNS system vs DoH:")
+        [void]$sb.AppendLine("DNS: система vs DoH:")
         foreach ($d in @($script:ExtraDiag.Dns)) {
             [void]$sb.AppendLine(("  {0}: {1}  sys=[{2}] doh=[{3}]" -f $d.Host, $d.Status, $d.System, $d.Doh))
         }
+    } else {
+        [void]$sb.AppendLine("DNS: (нет данных — выполните скан Enter)")
     }
     if ($script:ExtraDiag.Quic) {
         $q = $script:ExtraDiag.Quic
         [void]$sb.AppendLine(("QUIC: {0}  yt={1}/{2}  ctrl={3}/{4}" -f $q.Summary, $q.Youtube.Status, $q.Youtube.Ip, $q.Control.Status, $q.Control.Ip))
+    } else {
+        [void]$sb.AppendLine("QUIC: (нет данных)")
     }
     if ($script:ExtraDiag.Tcp16) {
         $t = $script:ExtraDiag.Tcp16
         [void]$sb.AppendLine(("TCP16: {0}  host={1} ip={2} bytes={3} ({4})" -f $t.Status, $t.Host, $t.Ip, $t.Bytes, $t.Detail))
+    } else {
+        [void]$sb.AppendLine("TCP16: (нет данных)")
     }
     if ($script:ExtraDiag.IpVsSni) {
         $x = $script:ExtraDiag.IpVsSni
         [void]$sb.AppendLine(("IP vs SNI: {0}  ip={1} yt={2} ctrl={3}" -f $x.Status, $x.Ip, $x.YoutubeCell, $x.ControlCell))
+    } else {
+        [void]$sb.AppendLine("IP vs SNI: (нет данных)")
     }
     if ($script:ExtraDiag.RstStats) {
-        [void]$sb.AppendLine(("RST phases: CH={0} POST={1}" -f $script:ExtraDiag.RstStats.RstCh, $script:ExtraDiag.RstStats.RstPost))
+        [void]$sb.AppendLine(("Фазы RST: CH={0} POST={1}" -f $script:ExtraDiag.RstStats.RstCh, $script:ExtraDiag.RstStats.RstPost))
     }
     [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("=== RECOMMENDATIONS ===")
-    foreach ($r in @($script:ExtraDiag.Recommendations)) {
-        [void]$sb.AppendLine(("* {0}" -f $r))
+    [void]$sb.AppendLine("=== РЕКОМЕНДАЦИИ ===")
+    $recs = @($script:ExtraDiag.Recommendations)
+    if ($recs.Count -eq 0) {
+        [void]$sb.AppendLine("* (пока пусто — выполните скан Enter)")
+    } else {
+        foreach ($r in $recs) {
+            [void]$sb.AppendLine(("* {0}" -f $r))
+        }
     }
     return $sb.ToString()
 }
@@ -5932,8 +6972,10 @@ function Invoke-BatchSuite {
     $script:Targets = Get-Targets -NetInfo $script:NetInfo
     Write-Host ("[ SCAN ] {0} targets..." -f $script:Targets.Count)
     $scanResult = Start-ScanWithAnimation $script:Targets $global:ProxyConfig $false
-    $script:LastScanResults = $scanResult.Results
-    $script:HasCompletedScan = -not $scanResult.Aborted
+    if ($scanResult.CommitResults -ne $false) {
+        $script:LastScanResults = $scanResult.Results
+    }
+    $script:HasCompletedScan = (-not $scanResult.Aborted) -or $script:HasCompletedScan
     Invoke-PostScanExtras
     $txt = if ($script:TxtReportPath) { $script:TxtReportPath } else { Join-Path $script:ParentDirForReports $CONST.Batch.DefaultTxtName }
     Save-ScanReportToPath -Path $txt -Silent
@@ -6036,11 +7078,20 @@ function Invoke-SettingsAction {
 function Invoke-ScanAction {
     Write-DebugLog "Запуск сканирования по Enter (ULTRA-FAST MODE)"
 
+    if ($script:ScanPhase -ne "Idle") {
+        Write-DebugLog "Scan already in phase=$($script:ScanPhase) — ignore Enter" "INFO"
+        return
+    }
+    $script:ScanPhase = "Running"
+    Stop-DeferredPostScanExtras
+    $script:ExtrasStep = 0
+
+    try {
     # === МГНОВЕННАЯ ПРОВЕРКА ИНТЕРНЕТА ===
     Draw-StatusBar -Message "[ CHECK ] Проверка интернета..." -Fg "Black" -Bg "Cyan"
     if (-not (Test-InternetAvailable)) {
         Draw-StatusBar -Message "[ ERROR ] НЕТ ИНТЕРНЕТА! ПРОВЕРЬТЕ ПОДКЛЮЧЕНИЕ." -Fg "Black" -Bg "Red"
-        Start-Sleep -Seconds 3
+        Start-Sleep -Seconds 2
         Draw-StatusBar
         Clear-KeyBuffer
         return
@@ -6070,37 +7121,43 @@ function Invoke-ScanAction {
     }
     if (-not (Ensure-TlsScannerLoaded)) {
         Draw-StatusBar -Message "[ ERROR ] TLS scanner failed to load. Scan cancelled." -Fg "White" -Bg "Red"
-        Start-Sleep -Seconds 3
+        Start-Sleep -Seconds 2
         Draw-StatusBar
         return
     }
 
     # === МГНОВЕННЫЙ СТАРТ СКАНА ===
     Draw-StatusBar -Message "[ SCAN ] Запуск сканирования..." -Fg "Black" -Bg "Green"
-    Start-Sleep -Milliseconds 200  # Минимальная пауза для визуального отклика
 
-    # Запускаем асинхронный скан
     $scanResult = Start-ScanWithAnimation $script:Targets $global:ProxyConfig $placeholderRowsVisible
-    $script:LastScanResults = $scanResult.Results
+    $script:ScanPhase = "Finishing"
+
+    if ($scanResult.CommitResults -ne $false) {
+        $script:LastScanResults = $scanResult.Results
+    }
     Sync-DynamicColPosFromLayout
     Update-UiConsoleSnapshot
 
-    # === ФИНИШ ===
-    Start-Sleep -Milliseconds 400
-
     if ($scanResult.Aborted) {
-        Draw-StatusBar -Message "[ ABORTED ] Скан прерван. Нажмите ENTER для продолжения..." -Fg "Black" -Bg "Red"
+        Draw-StatusBar -Message "[ ABORTED ] Скан прерван." -Fg "Black" -Bg "Red"
+        $script:ExtrasStep = 0
     } else {
         $script:HasCompletedScan = $true
         Update-NetInfoFromCompletedJob
-        Draw-StatusBar -Message "[ SUCCESS ] Скан завершен!" -Fg "Black" -Bg "Green"
-        Start-Sleep -Milliseconds 400
-        Invoke-PostScanExtras
+        # Idle STATUS immediately — EXTRA deferred so keys work right after the table.
+        Draw-StatusBar
+        if ($script:BatchMode -or $script:NoExtras) {
+            Invoke-PostScanExtras
+        } else {
+            Start-DeferredPostScanExtras
+        }
     }
 
-    Start-Sleep -Seconds 2
-    Draw-StatusBar
     Clear-KeyBuffer
+    }
+    finally {
+        $script:ScanPhase = "Idle"
+    }
 }
 
 # ====================================================================================
@@ -6112,8 +7169,8 @@ function Initialize-AppState {
     $script:Config = Load-Config
     $global:ProxyConfig = $script:Config.Proxy
 
-    if ($null -eq $script:Config.WarnBypassTools) {
-        $script:Config | Add-Member -MemberType NoteProperty -Name "WarnBypassTools" -Value $true -Force
+    if ($null -eq $script:Config.WarnBypassTools -or [bool]$script:Config.WarnBypassTools) {
+        $script:Config | Add-Member -MemberType NoteProperty -Name "WarnBypassTools" -Value $false -Force
         Save-Config $script:Config
     }
     foreach ($pair in @(
@@ -6209,10 +7266,19 @@ while ($true) {
 
 
     $k = Read-MainLoopKey
-    [Console]::CursorVisible = $false
+    if ($script:UiCursorHidden -ne $true) {
+        [Console]::CursorVisible = $false
+        $script:UiCursorHidden = $true
+    }
     try { [Console]::CursorSize = 1 } catch { }
 
-    $null = Invoke-FullUiRedrawIfConsoleResized
+        # Scroll first — skip Force-resize check (saves latency before paint).
+        if (Test-IsTableScrollKey $k) {
+            $null = Invoke-CoalescedTableScroll -FirstKey $k
+            continue
+        }
+
+    $null = Invoke-FullUiRedrawIfConsoleResized -Force
 
         if ($k -eq "Q" -or $k -eq "Escape") {
             Stop-Script
@@ -6253,6 +7319,10 @@ while ($true) {
 
         # Обработка Enter
         if ($k -eq "Enter") {
+            if ($script:ScanPhase -ne "Idle") {
+                Write-DebugLog "Ignore Enter while ScanPhase=$($script:ScanPhase)" "INFO"
+                continue
+            }
             Invoke-ScanAction
             continue
         }

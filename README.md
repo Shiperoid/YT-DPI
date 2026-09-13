@@ -1,6 +1,6 @@
 # YT-DPI
 
-![Windows](https://img.shields.io/badge/Windows%20.ps1-3.0-green)
+![Windows](https://img.shields.io/badge/Windows%20.ps1-3.0.1-green)
 ![Bash](https://img.shields.io/badge/Bash%20.sh-2.3.3-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![Telegram](https://img.shields.io/badge/Telegram-blue)](https://t.me/YT_DPI)
@@ -10,10 +10,12 @@
 
 | Платформа | Файлы | Версия в релизе |
 | :--- | :--- | :--- |
-| **Windows 10/11** | `YT-DPI.bat` + `YT-DPI.ps1` | **3.0** |
-| **Linux / macOS / Git Bash / Entware** | `YT-DPI.sh` | **2.3.3** |
+| **Windows 10/11** | `YT-DPI.bat` + `YT-DPI.ps1` | **3.0.1** |
+| **Linux / macOS / Git Bash / Entware** | `YT-DPI.sh` | **2.3.3** (без изменений в 3.0.1) |
 
-Движок Windows в баннере: **Barebuh Pro v3.1 / TUI v1.2**. Bash: **Barebuh Pro v2.3.7** (логика через `curl`). Подробный diff Windows 2.3.3 → 3.0 — в [CHANGELOG.md](CHANGELOG.md).
+Движок Windows в баннере: **Barebuh Pro v3.2 / TUI v1.5.3**. Bash: **Barebuh Pro v2.3.7** (логика через `curl`).
+
+**Windows 3.0.1 / TUI v1.5.3** — прокачанный интерфейс под **большие `targets.txt` без лагов**: viewport (NAV/STATUS внизу), быстрая прокрутка без мерцания, скролл сразу после скана (EXTRA в фоне), shared RunspacePool + WaitAny на collect. Полный diff 2.3.3 → 3.0 и патч 3.0.1 — в [CHANGELOG.md](CHANGELOG.md).
 
 ![Preview](https://raw.githubusercontent.com/Shiperoid/YT-DPI/refs/heads/master/img/YT-DPI-v3.0.png)
 
@@ -27,7 +29,7 @@
 4. [Что умеет каждая версия](#что-умеет-каждая-версия)
 5. [Горячие клавиши](#горячие-клавиши)
 6. [Таблица: колонки, коды ячеек, вердикты](#таблица-колонки-коды-ячеек-вердикты)
-7. [EXTRA DIAG (только Windows 3.0)](#extra-diag-только-windows-30)
+7. [EXTRA DIAG (только Windows 3.x)](#extra-diag-только-windows-3x)
 8. [Настройки, файлы, переменные окружения](#настройки-файлы-переменные-окружения)
 9. [Batch / CLI (Windows)](#batch--cli-windows)
 10. [Типичные проблемы и что делать](#типичные-проблемы-и-что-делать)
@@ -39,10 +41,11 @@
 
 ### Windows
 
-1. Скачайте **`YT-DPI.bat`** и **`YT-DPI.ps1`** из [Releases](https://github.com/Shiperoid/YT-DPI/releases) (тег **3.0**) в **одну** папку.
+1. Скачайте **`YT-DPI.bat`** и **`YT-DPI.ps1`** из [Releases](https://github.com/Shiperoid/YT-DPI/releases) (тег **3.0.1**) в **одну** папку.
 2. Запустите **`YT-DPI.bat`** (лаунчер сам выберет `pwsh`, иначе Windows PowerShell 5.1).
 3. Нажмите **Enter** — полный скан. Смотрите колонку **RESULT** и строку **STATUS**.
 4. При необходимости: **`[D]`** DNS, **`[G]`** PATH, **`[E]`** EXTRA, **`[R]`** отчёт, **`[H]`** справка.
+5. Длинный `targets.txt`: **↑↓ / PgUp / PgDn / Home / End** — плавная прокрутка **без лагов** (рисуется только видимый viewport; NAV/STATUS остаются внизу; можно листать сразу после скана).
 
 Headless:
 
@@ -67,7 +70,7 @@ bash <(curl -Ls "https://raw.githubusercontent.com/Shiperoid/YT-DPI/2.3.3/YT-DPI
 
 ## Требования
 
-### Windows 3.0
+### Windows 3.0.1
 
 * Windows 10/11.
 * **PowerShell 7 (`pwsh`)** предпочтительно; работает и **Windows PowerShell 5.1**.
@@ -96,6 +99,7 @@ bash <(curl -Ls "https://raw.githubusercontent.com/Shiperoid/YT-DPI/2.3.3/YT-DPI
 | Справка CLI | `YT-DPI.bat --help` |
 | Прямой запуск ps1 | `pwsh -NoProfile -File YT-DPI.ps1` (лучше через `.bat`: выставляет `SCRIPT_PATH`) |
 | Автоподгрузка ps1 | Если `.ps1` нет рядом, `.bat` может скачать его с GitHub (bootstrap) |
+| Обновление `[U]` | Заменяет `.ps1` и компаньон `.bat` (с `master`) |
 
 Файлы рядом: `YT-DPI.bat`, `YT-DPI.ps1`, опционально `targets.txt`. Конфиг: `%LOCALAPPDATA%\YT-DPI\`. Отчёты/лог — обычно рядом со скриптом / в cwd.
 
@@ -122,7 +126,7 @@ chmod +x YT-DPI.sh && ./YT-DPI.sh
 2. Откройте *Git Bash*, `cd` в папку со скриптом, `./YT-DPI.sh`.
 3. Скрипт учитывает `MSYSTEM` и снижает частоту анимации.
 
-Для полного Windows-функционала 3.0 используйте **`.bat` + `.ps1`**, не `.sh`.
+Для полного Windows-функционала 3.x используйте **`.bat` + `.ps1`**, не `.sh`.
 
 ### Entware / OpenWrt / роутеры
 
@@ -144,17 +148,18 @@ bash <(curl -Ls "https://raw.githubusercontent.com/Shiperoid/YT-DPI/2.3.3/YT-DPI
 
 ## Что умеет каждая версия
 
-| Возможность | Windows 3.0 | Bash 2.3.3 |
+| Возможность | Windows 3.0.1 | Bash 2.3.3 |
 | :--- | :---: | :---: |
 | Параллельный скан доменов (HTTP :80, TLS 1.2 / 1.3) | да (C# Barebuh) | да (`curl`) |
 | Вердикты AVAILABLE / THROTTLED / DPI RESET / DPI BLOCK / IP BLOCK | да | да |
 | Прокси HTTP/SOCKS + история | да (`[P]`) | да (`[P]`) |
 | Тест прокси с главного экрана | нет (только в `[P]`) | да (`[T]`) |
 | `targets.txt` + `[S] 6/7` | да | да |
+| Прокрутка длинной таблицы без лагов (viewport TUI v1.5.3) | да | нет |
 | Debug-лог `YT-DPI_Debug.log` | да | да |
-| Автообновление `[U]` | да | нет |
+| Автообновление `[U]` (`.ps1` + `.bat`) | да | нет |
 | DNS system vs DoH `[D]` | да | нет |
-| PATH ICMP mtr-lite `[G]` | да | нет |
+| PATH ICMP mtr-lite `[G]` (не через прокси/VPN) | да | нет |
 | EXTRA DIAG `[E]` + post-scan extras | да | нет |
 | LAT bars / `RST*` | да | нет |
 | Batch / JSON CLI | да | нет |
@@ -164,23 +169,24 @@ bash <(curl -Ls "https://raw.githubusercontent.com/Shiperoid/YT-DPI/2.3.3/YT-DPI
 
 ## Горячие клавиши
 
-### Windows 3.0
+### Windows 3.0.1
 
 | Клавиша | Действие |
 | :--- | :--- |
-| **Enter** | Полный скан таблицы (+ extras после скана, если не `--no-extras`) |
+| **Enter** | Полный скан таблицы (+ extras в фоне после скана, если не `--no-extras`) |
+| **↑↓ / PgUp / PgDn / Home / End** | Прокрутка таблицы при большом числе целей (в т.ч. сразу после скана, пока EXTRA идёт в фоне) |
 | **S** | Настройки |
 | **P** | Прокси |
 | **D** | DNS: system vs DoH |
-| **G** | PATH: ICMP TTL к домену # или CDN (Enter) |
-| **E** | Полный EXTRA DIAG |
-| **U** | Обновление с GitHub |
+| **G** | PATH: ICMP TTL к домену # или CDN (Enter); при прокси/VPN — отказ с пояснением |
+| **E** | Полный EXTRA DIAG (текст на русском) |
+| **U** | Обновление с GitHub (`.ps1` + companion `.bat`) |
 | **R** | Отчёт TXT (+ JSON) |
 | **H** | Справка (несколько страниц) |
 | **Q / Esc** | Выход (конфиг сохраняется) |
-| Во время скана | **Q / Esc** — прервать (см. STATUS) |
+| Во время скана | **Q / Esc** — прервать; стрелки — прокрутка видимых строк |
 
-Нижний UI: строка **NAV** (кнопки), под ней **STATUS** (прогресс / итог / разовый tip).
+Нижний UI: строка **NAV** (кнопки), под ней **STATUS** (прогресс / итог скана). Bypass-предупреждение — **один раз при старте**; рекомендации EXTRA — в **`[E]`**, не спамят STATUS после каждого скана.
 
 ### Bash 2.3.3
 
@@ -240,7 +246,7 @@ bash <(curl -Ls "https://raw.githubusercontent.com/Shiperoid/YT-DPI/2.3.3/YT-DPI
 | **UNKNOWN** / **IDLE** | Ошибка воркера / не сканировали | Перескан |
 | **ROUTING ERROR** | Только bash: HTTP FAIL + TLS RST | Прокси/маршрутизация |
 
-**Важно:** перед замером DPI провайдера **отключите** zapret / GoodbyeDPI / winws. Иначе Windows 3.0 покажет bypass-banner, а картина будет «обхода», а не провайдера.
+**Важно:** перед замером DPI провайдера **отключите** zapret / GoodbyeDPI / winws. Иначе Windows покажет bypass-banner при старте, а картина будет «обхода», а не провайдера.
 
 ### Почему лагает YouTube (кратко)
 
@@ -254,9 +260,9 @@ bash <(curl -Ls "https://raw.githubusercontent.com/Shiperoid/YT-DPI/2.3.3/YT-DPI
 
 ---
 
-## EXTRA DIAG (только Windows 3.0)
+## EXTRA DIAG (только Windows 3.x)
 
-После **Enter**-скана (если не `--no-extras`) дополнительно:
+После **Enter**-скана (если не `--no-extras`) дополнительно (пробы не блокируют повторный Enter — идут по шагам в фоне UI):
 
 | Проба | Статусы / смысл |
 | :--- | :--- |
@@ -265,7 +271,7 @@ bash <(curl -Ls "https://raw.githubusercontent.com/Shiperoid/YT-DPI/2.3.3/YT-DPI
 | TCP16 | `TCP16_OK`, `TCP16_DROP`, `TCP16_FAIL` |
 | IP vs SNI | `OK`, `SNI_BLOCK`, `IP_BLOCK`, `MIXED` |
 
-**`[D]`** — тот же DNS-проход вручную. **`[G]`** — PATH (hop/loss/RTT). **`[E]`** — полный текст + recommendations. Tip после extras — **один раз** в STATUS.
+**`[D]`** — тот же DNS-проход вручную. **`[G]`** — PATH (hop/loss/RTT); **не используйте через включённый прокси или VPN** — ICMP TTL там неинформативен, UI откажет с пояснением. **`[E]`** — полный текст и рекомендации на русском.
 
 ---
 
@@ -336,14 +342,16 @@ YT-DPI.bat --help
 
 | Проблема | Решение |
 | :--- | :--- |
-| «TLS scanner failed to load» | Обновите до 3.0; проверьте PS 5.1/7; смотрите debug-лог; антивирус |
+| «TLS scanner failed to load» | Обновите до **3.0.1**; проверьте PS 5.1/7; смотрите debug-лог; антивирус |
 | Все строки IP BLOCK | Интернет, DNS, VPN/прокси, не пустой кэш; `[S]→2` сброс кэша |
-| Картина «всё зелёное», а YouTube плохой | Выключены ли bypass-tools? Смотрите EXTRA QUIC/TCP16 |
+| Картина «всё зелёное», а YouTube плохой | Выключены ли bypass-tools? Смотрите EXTRA QUIC/TCP16 в `[E]` |
+| Много целей в `targets.txt`, STATUS наезжает / лаги скролла | Обновите до **3.0.1** (TUI **v1.5.3**): viewport + delta-scroll без мерцания; увеличьте окно при желании |
+| PATH: один hop / 0 ms | Типично VPN/прокси — отключите их или не используйте `[G]`; для прокси смотрите Enter-скан |
 | Кириллица кракозябрами | Windows Terminal, UTF-8, `chcp 65001` |
-| Таблица «плывёт» | Увеличьте окно консоли; после меню UI должна восстановиться сама |
+| Таблица «плывёт» при ресайзе | **3.0.1**: debounce + полная перерисовка; предпочтителен Windows Terminal |
 | Bash: нет сохранения настроек | Установите `jq` |
-| Нужен Update | Только Windows `[U]` |
-| Нужен DNS/PATH/EXTRA | Только Windows 3.0 |
+| Нужен Update | Только Windows `[U]` (обновляет `.ps1` и `.bat`) |
+| Нужен DNS/PATH/EXTRA | Только Windows 3.x |
 
 Сохраняйте **`[R]`** перед тем как слать скриншоты/логи в поддержку.
 

@@ -110,6 +110,10 @@ $v3Required = @(
     'function Show-BypassWarningBanner',
     'function Export-YtDpiJsonReport',
     'function Invoke-PostScanExtras',
+    'function Invoke-PostScanExtrasBody',
+    'function Ensure-ScanRunspacePool',
+    'function Update-ExtrasFromCompletedAsync',
+    'function Stop-DeferredPostScanExtras',
     'function Invoke-DnsScanAction',
     'function Flush-UiFrame',
     'function Invoke-IcmpTtlPathProbe',
@@ -119,8 +123,8 @@ $missingV3 = @()
 foreach ($pat in $v3Required) {
     if ($mainRawForV3 -notlike "*$pat*") { $missingV3 += $pat }
 }
-if ($mainRawForV3 -notmatch '\$scriptVersion\s*=\s*"3\.0"') {
-    $missingV3 += 'scriptVersion 3.0'
+if ($mainRawForV3 -notmatch '\$scriptVersion\s*=\s*"3\.0(\.\d+)?"') {
+    $missingV3 += 'scriptVersion 3.0.x'
 }
 if ($mainRawForV3 -notmatch 'RstPhase') {
     $missingV3 += 'RstPhase in YT-DPI.ps1'
@@ -139,6 +143,15 @@ if ($mainRawForV3 -match 'function Trace-TcpRoute|function Invoke-TraceAction|Ad
 }
 if ($mainRawForV3 -match 'YT-DPI\.v3\.extras\.ps1') {
     $missingV3 += 'extras file reference (must be inlined)'
+}
+if ($mainRawForV3 -notmatch '\[System\.Threading\.WaitHandle\]::WaitAny') {
+    $missingV3 += 'WaitAny collect loop'
+}
+if ($mainRawForV3 -notmatch 'ScanRunspacePool') {
+    $missingV3 += 'ScanRunspacePool reuse'
+}
+if ($mainRawForV3 -match 'function Invoke-DeferredPostScanExtrasStep') {
+    $missingV3 += 'Invoke-DeferredPostScanExtrasStep leftover (replaced by async EXTRA)'
 }
 $extrasPath = Join-Path $RepoRoot 'YT-DPI.v3.extras.ps1'
 if (Test-Path -LiteralPath $extrasPath) {
