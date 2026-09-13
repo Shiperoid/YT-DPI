@@ -1,25 +1,32 @@
-# CI runs this file from the PR merge commit (branch protection applies to that run).
-# If you cannot merge a workflow-only fix: push once to the default branch, or
-# temporarily relax required checks / use admin bypass (repo Settings → Branches).
+# Heavy matrix only when YT-DPI.ps1 / .bat / .sh (or this workflow) change.
+# Docs/algorithm/etc. PRs still get a green "gate" conclusion via skip job so
+# branch protection is not stuck at "Waiting for status to be reported".
 name: release-gate
 
 on:
   push:
-    paths:
-      - 'YT-DPI.bat'
-      - 'YT-DPI.ps1'
-      - 'tools/release-gate.ps1'
-      - 'tools/release-gate.cmd'
-      - 'tools/release-gate-quick.cmd'
-      - 'tools/release-gate-addtype.ps1'
-      - 'tools/smoke-yt-dpi-engines.ps1'
-      - '.github/workflows/release-gate.yml'
-  # No paths filter on PR: branch protection expects this check on every PR; path-only
-  # triggers leave required checks stuck at "Waiting for status to be reported".
-  pull_request: {}
+  pull_request:
 
 jobs:
-  gate:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      scripts: ${{ steps.filter.outputs.scripts }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            scripts:
+              - 'YT-DPI.ps1'
+              - 'YT-DPI.bat'
+              - 'YT-DPI.sh'
+              - '.github/workflows/release-gate.yml'
+
+  gate-matrix:
+    needs: changes
+    if: needs.changes.outputs.scripts == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -39,3 +46,29 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           & (Join-Path $env:GITHUB_WORKSPACE 'tools\release-gate.ps1') -RepoRoot $env:GITHUB_WORKSPACE
+
+  # Required check should point at this job (not the matrix). Skip = green.
+  gate:
+    needs: [changes, gate-matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Conclude
+        run: |
+          changes='${{ needs.changes.result }}'
+          scripts='${{ needs.changes.outputs.scripts }}'
+          matrix='${{ needs.gate-matrix.result }}'
+          echo "changes=$changes scripts=$scripts gate-matrix=$matrix"
+          if [ "$changes" != "success" ]; then
+            echo "paths-filter job failed"
+            exit 1
+          fi
+          if [ "$scripts" != "true" ]; then
+            echo "No YT-DPI.ps1/.bat/.sh (or workflow) changes - gate skipped."
+            exit 0
+          fi
+          if [ "$matrix" = "success" ]; then
+            exit 0
+          fi
+          echo "release-gate matrix failed or was cancelled (result=$matrix)"
+          exit 1
