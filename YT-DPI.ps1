@@ -480,12 +480,21 @@ function Start-BackgroundNetInfoUpdate {
             HasIPv6 = $false
         }
 
-        # DNS
+        # DNS (WMI, then DnsClient)
         try {
             $wmi = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" |
-                   Where-Object { $_.DNSServerSearchOrder -ne $null } | Select-Object -First 1
-            if ($wmi) { $result.DNS = $wmi.DNSServerSearchOrder[0] }
+                   Where-Object { $_.DNSServerSearchOrder -ne $null -and @($_.DNSServerSearchOrder).Count -gt 0 } |
+                   Select-Object -First 1
+            if ($wmi) { $result.DNS = [string](@($wmi.DNSServerSearchOrder)[0]) }
         } catch {}
+        if ($result.DNS -eq "UNKNOWN") {
+            try {
+                $row = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop |
+                    Where-Object { $_.ServerAddresses -and @($_.ServerAddresses).Count -gt 0 } |
+                    Select-Object -First 1
+                if ($row) { $result.DNS = [string](@($row.ServerAddresses)[0]) }
+            } catch {}
+        }
 
         # CDN через redirector
         try {
@@ -504,27 +513,67 @@ function Start-BackgroundNetInfoUpdate {
             }
         } catch {}
 
-        # GEO (с агрессивным таймаутом - 1.5 секунды на каждый)
-        $geoUrls = @(
-            "https://ip-api.com/json/?fields=status,countryCode,city,isp",
-            "https://ipapi.co/json/"
+        # GEO — working endpoints first (ip-api / ipapi.co often 403)
+        $geoProviders = @(
+            @{ Url = "https://api.ip.sb/geoip"; Kind = "ip.sb" },
+            @{ Url = "https://ipwhois.app/json/"; Kind = "ipwhois" },
+            @{ Url = "https://ipinfo.io/json"; Kind = "ipinfo" },
+            @{ Url = "https://ifconfig.co/json"; Kind = "ifconfig" },
+            @{ Url = "https://ip-api.com/json/?fields=status,countryCode,city,isp"; Kind = "ip-api" },
+            @{ Url = "https://ipapi.co/json/"; Kind = "ipapi" }
         )
-        foreach ($url in $geoUrls) {
-            $raw = Invoke-WebRequestFast $url 1500
-            if ($raw -match '\{.*\}') {
-                try {
-                    $data = $raw | ConvertFrom-Json
-                    if ($data.status -eq "success" -and $data.isp) {
-                        $result.ISP = $data.isp -replace '(?i)\s*(LLC|Inc\.?|Ltd\.?|sp\. z o\.o\.|CJSC|OJSC|PJSC|PAO|ZAO|OOO|JSC|Private Enterprise|Group|Corporation)', ''
-                        $result.LOC = "$($data.city), $($data.countryCode)"
-                        break
-                    } elseif ($data.org) {
-                        $result.ISP = $data.org
-                        $result.LOC = "$($data.city), $($data.country_code)"
-                        break
+        foreach ($gp in $geoProviders) {
+            $raw = Invoke-WebRequestFast $gp.Url 2000
+            if ($raw -notmatch '\{.*\}') { continue }
+            try {
+                $data = $raw | ConvertFrom-Json
+                $ispVal = $null; $locVal = $null
+                switch ($gp.Kind) {
+                    "ip.sb" {
+                        if ($data.isp -and $data.country_code) {
+                            $ispVal = $data.isp
+                            $locVal = "$($data.city), $($data.country_code)"
+                        }
                     }
-                } catch {}
-            }
+                    "ipwhois" {
+                        if ($data.success -eq $true -and $data.isp) {
+                            $ispVal = $data.isp
+                            $locVal = "$($data.city), $($data.country_code)"
+                        }
+                    }
+                    "ipinfo" {
+                        if (-not $data.error -and $data.org -and $data.country) {
+                            $ispVal = ($data.org -split '\s+', 3)[0..1] -join ' '
+                            $locVal = "$($data.city), $($data.country)"
+                        }
+                    }
+                    "ifconfig" {
+                        $org = if ($data.asn_org) { $data.asn_org } else { $data.org }
+                        $cc = if ($data.country_iso) { $data.country_iso } else { $data.country }
+                        if ($org -and $cc) {
+                            $ispVal = $org
+                            $locVal = if ($data.city) { "$($data.city), $cc" } else { [string]$cc }
+                        }
+                    }
+                    "ip-api" {
+                        if ($data.status -eq "success" -and $data.isp) {
+                            $ispVal = $data.isp
+                            $locVal = "$($data.city), $($data.countryCode)"
+                        }
+                    }
+                    "ipapi" {
+                        if (-not $data.error -and $data.org -and $data.country_code) {
+                            $ispVal = $data.org
+                            $locVal = "$($data.city), $($data.country_code)"
+                        }
+                    }
+                }
+                if ($ispVal -and $locVal) {
+                    $result.ISP = $ispVal -replace '(?i)\s*(LLC|Inc\.?|Ltd\.?|sp\. z o\.o\.|CJSC|OJSC|PJSC|PAO|ZAO|OOO|JSC|Private Enterprise|Group|Corporation)', ''
+                    $result.LOC = $locVal
+                    break
+                }
+            } catch {}
         }
 
         if ($result.ISP.Length -gt 25) { $result.ISP = $result.ISP.Substring(0, 22) + "..." }
@@ -940,9 +989,85 @@ function Test-NetInfoUsable {
     $isp = [string]$NetInfo.ISP
     $loc = [string]$NetInfo.LOC
     if ([string]::IsNullOrWhiteSpace($isp)) { return $false }
-    if ($isp -in @("Loading...", "Detecting...", "Background update", "Unknown")) { return $false }
-    if ($loc -in @("Please wait", "Next scan")) { return $false }
+    if ($isp -in @("Loading...", "Detecting...", "Background update", "Unknown", "Geo unavailable")) { return $false }
+    if ($loc -in @("Please wait", "Next scan", "Use --fast-mode", "Unknown")) { return $false }
     return $true
+}
+
+function Get-SystemDnsPrimary {
+    # Prefer WMI; fall back to DnsClient (WWAN/VPN often empty in Win32_NetworkAdapterConfiguration).
+    try {
+        $wmi = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" |
+            Where-Object { $_.DNSServerSearchOrder -ne $null -and @($_.DNSServerSearchOrder).Count -gt 0 } |
+            Select-Object -First 1
+        if ($wmi) {
+            $d = [string](@($wmi.DNSServerSearchOrder)[0])
+            if (-not [string]::IsNullOrWhiteSpace($d)) { return $d.Trim() }
+        }
+    } catch { }
+    try {
+        $row = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object { $_.ServerAddresses -and @($_.ServerAddresses).Count -gt 0 } |
+            Select-Object -First 1
+        if ($row) {
+            $d = [string](@($row.ServerAddresses)[0])
+            if (-not [string]::IsNullOrWhiteSpace($d)) { return $d.Trim() }
+        }
+    } catch { }
+    return "UNKNOWN"
+}
+
+function Get-GeoProviderDefinitions {
+    # Order: currently reachable first. ip-api.com / ipapi.co often 403 from datacenter/VPN IPs.
+    @(
+        [PSCustomObject]@{
+            Name   = "api.ip.sb"
+            Url    = "https://api.ip.sb/geoip"
+            Check  = { param($j) $j.isp -and $j.country_code }
+            GetISP = { param($j) $j.isp }
+            GetLOC = { param($j) "$($j.city), $($j.country_code)" }
+        }
+        [PSCustomObject]@{
+            Name   = "ipwhois.io"
+            Url    = "https://ipwhois.app/json/"
+            Check  = { param($j) $j.success -eq $true -and $j.isp }
+            GetISP = { param($j) $j.isp }
+            GetLOC = { param($j) "$($j.city), $($j.country_code)" }
+        }
+        [PSCustomObject]@{
+            Name   = "ipinfo.io"
+            Url    = "https://ipinfo.io/json"
+            Check  = { param($j) -not $j.error -and $j.org -and $j.country }
+            GetISP = { param($j) ($j.org -split '\s+', 3)[0..1] -join ' ' }
+            GetLOC = { param($j) "$($j.city), $($j.country)" }
+        }
+        [PSCustomObject]@{
+            Name   = "ifconfig.co"
+            Url    = "https://ifconfig.co/json"
+            Check  = { param($j) ($j.asn_org -or $j.org) -and ($j.country_iso -or $j.country) }
+            GetISP = { param($j) if ($j.asn_org) { $j.asn_org } else { $j.org } }
+            GetLOC = {
+                param($j)
+                $city = if ($j.city) { [string]$j.city } else { "" }
+                $cc = if ($j.country_iso) { [string]$j.country_iso } elseif ($j.country) { [string]$j.country } else { "" }
+                if ($city) { "$city, $cc" } else { $cc }
+            }
+        }
+        [PSCustomObject]@{
+            Name   = "ip-api.com"
+            Url    = "https://ip-api.com/json/?fields=status,countryCode,city,isp"
+            Check  = { param($j) $j.status -eq "success" -and $j.isp }
+            GetISP = { param($j) $j.isp }
+            GetLOC = { param($j) "$($j.city), $($j.countryCode)" }
+        }
+        [PSCustomObject]@{
+            Name   = "ipapi.co"
+            Url    = "https://ipapi.co/json/"
+            Check  = { param($j) -not $j.error -and $j.org -and $j.country_code }
+            GetISP = { param($j) $j.org }
+            GetLOC = { param($j) "$($j.city), $($j.country_code)" }
+        }
+    )
 }
 
 function Set-NetInfoCacheIfUsable {
@@ -3801,14 +3926,7 @@ function Get-NetworkInfo {
     Write-DebugLog "Get-NetworkInfo: начало"
 
     # 1. БЫСТРЫЙ DNS
-    $dns = "UNKNOWN"
-    try {
-        $wmi = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" |
-               Where-Object { $_.DNSServerSearchOrder -ne $null } | Select-Object -First 1
-        if ($wmi -and $wmi.DNSServerSearchOrder) {
-            $dns = $wmi.DNSServerSearchOrder[0]
-        }
-    } catch { }
+    $dns = Get-SystemDnsPrimary
 
     # 2. CDN через redirector (через тот же путь, что и остальной HTTP: $global:ProxyConfig)
     $cdn = "manifest.googlevideo.com"
@@ -3839,50 +3957,17 @@ function Get-NetworkInfo {
         Write-DebugLog "GEO из кэша: $isp / $loc"
     }
     else {
-        # Список провайдеров (URL, проверка, извлечение ISP / LOC)
-        $providers = @(
-            [PSCustomObject]@{
-                Name   = "ip-api.com"
-                Url    = "https://ip-api.com/json/?fields=status,countryCode,city,isp"
-                Check  = { param($j) $j.status -eq "success" }
-                GetISP = { param($j) $j.isp }
-                GetLOC = { param($j) "$($j.city), $($j.countryCode)" }
-            }
-            [PSCustomObject]@{
-                Name   = "ifconfig.co"
-                Url    = "https://ifconfig.co/json"
-                Check  = { param($j) $j.org -and $j.country }
-                GetISP = { param($j) $j.org }
-                GetLOC = { param($j) "$($j.city), $($j.country)" }
-            }
-            [PSCustomObject]@{
-                Name   = "ipapi.co"
-                Url    = "https://ipapi.co/json/"
-                Check  = { param($j) -not $j.error -and $j.org -and $j.country_code }
-                GetISP = { param($j) $j.org }
-                GetLOC = { param($j) "$($j.city), $($j.country_code)" }
-            }
-            [PSCustomObject]@{
-                Name   = "ipwhois.io"
-                Url    = "https://ipwhois.app/json/"
-                Check  = { param($j) $j.success -eq $true -and $j.isp }
-                GetISP = { param($j) $j.isp }
-                GetLOC = { param($j) "$($j.city), $($j.country_code)" }
-            }
-            [PSCustomObject]@{
-                Name   = "ipinfo.io"
-                Url    = "https://ipinfo.io/json"
-                Check  = { param($j) -not $j.error -and $j.org -and $j.country }
-                GetISP = { param($j) ($j.org -split '\s+')[0..1] -join ' ' }
-                GetLOC = { param($j) "$($j.city), $($j.country)" }
-            }
-        )
+        $providers = @(Get-GeoProviderDefinitions)
+        $geoTimeout = 2000
+        if ($CONST.NetInfo -and $null -ne $CONST.NetInfo.GeoPerRequestMs) {
+            $geoTimeout = [Math]::Max(1500, [int]$CONST.NetInfo.GeoPerRequestMs)
+        }
 
         $geoResult = $null
         foreach ($provider in $providers) {
             try {
                 Write-DebugLog "GEO: пробуем $($provider.Name)"
-                $raw = Invoke-WebRequestViaProxy $provider.Url "GET" 1500
+                $raw = Invoke-WebRequestViaProxy $provider.Url "GET" $geoTimeout
                 if ($raw -match '\{.*\}') {
                     $json = $raw | ConvertFrom-Json
                     if (& $provider.Check $json) {
@@ -6039,9 +6124,18 @@ function Start-QuickNetInfoUpdater {
         $dns = "UNKNOWN"
         try {
             $wmi = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" |
-                Where-Object { $_.DNSServerSearchOrder -ne $null } | Select-Object -First 1
-            if ($wmi) { $dns = $wmi.DNSServerSearchOrder[0] }
+                Where-Object { $_.DNSServerSearchOrder -ne $null -and @($_.DNSServerSearchOrder).Count -gt 0 } |
+                Select-Object -First 1
+            if ($wmi) { $dns = [string](@($wmi.DNSServerSearchOrder)[0]) }
         } catch {}
+        if ($dns -eq "UNKNOWN") {
+            try {
+                $row = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop |
+                    Where-Object { $_.ServerAddresses -and @($_.ServerAddresses).Count -gt 0 } |
+                    Select-Object -First 1
+                if ($row) { $dns = [string](@($row.ServerAddresses)[0]) }
+            } catch {}
+        }
 
         # 2. Локальный CDN через redirector (ИСПРАВЛЕННАЯ версия)
         $cdn = "manifest.googlevideo.com"  # fallback
