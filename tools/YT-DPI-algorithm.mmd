@@ -1,36 +1,43 @@
 %%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '13px'}}}%%
 flowchart TB
-  S["<b>Старт</b><br/>UTF-8, лог, QuickEdit • глобалы • Add-Type TlsScanner + AdvancedTraceroute"]
+  S["<b>Старт</b><br/>UTF-8, лог, QuickEdit • глобалы • Add-Type TlsScanner"]
 
   E["<b>ENGINE</b><br/>Load-Config + DnsCache • заглушка UI → Get-Targets → Draw-UI<br/>Get-NetworkInfo → Targets+Draw-UI • при устаревшем кэше повтор сети<br/>RunCount%10=0 → Check-Update → подсказка U"]
 
   N["<b>Get-NetworkInfo</b><br/>DNS WMI • CDN redirector+прокси • GEO кэш 24ч или цепочка API • IPv6 если не только-IPv4"]
 
-  L["Read-MainLoopKey"]
+  L["Read-MainLoopKey<br/>poll 20ms • resize debounce • ExtrasPending→Update-ExtrasFromCompletedAsync"]
 
   H{"Клавиша?"}
 
-  SUB["<b>Не Enter</b><br/>Q/Esc Stop+Save • H Help • S Settings • P Proxy <i>(смена GEO→сеть+targets)</i><br/>R Report • U Update GitHub • D Deep trace по номеру • T TestProxy"]
+  SCR["<b>Scroll</b><br/>↑↓ PgUp/PgDn Home/End → CoalescedTableScroll<br/>viewport body only • delta SetBufferContents"]
 
-  EN["<b>Enter — скан</b><br/>Ping/TCP 8.8.8.8 fail→continue • NetCache из конфига<br/>кэш&gt;10мин/Loading→фон NetInfoUpdater • Get-Targets+Draw-UI<br/>Start-ScanWithAnimation → LastScan+Draw • job→обновить ISP"]
+  SUB["<b>Меню</b><br/>H Help • S Settings • P Proxy <i>(смена GEO→сеть+targets)</i><br/>D DNS DoH • G PATH ICMP • E EXTRA view<br/>R Report • U Update GitHub"]
 
-  SC["<b>Скан</b> Pool+$Worker • фаза1 Q/Esc abort • фаза2 reveal строк<br/>устарел NetInfo→sync • все IP BLOCK+HasIPv6→сброс v6+AAAA кэш"]
+  EN["<b>Enter — скан</b><br/>ScanPhase≠Idle→ignore • Internet check • NetCache<br/>Ensure-TlsScanner • Start-ScanWithAnimation<br/>LastScan • Start-DeferredPostScanExtras async"]
 
-  WK["<b>Воркер</b> DNS/PROXIED→HTTP80→ERR=IP BLOCK<br/>TLS1.3+retry • TLS1.2+retry • матрица: AVAILABLE/THROTTLED/DPI RESET/DPI BLOCK/IP BLOCK"]
+  SC["<b>Скан</b> Ensure-ScanRunspacePool + $Worker<br/>фаза1 WaitAny collect • Q/Esc abort+Stop workers • scroll OK<br/>фаза2 reveal только visible rows • shared pool не Dispose"]
 
-  F["Draw-UI, статус, Clear-KeyBuffer → снова цикл"]
+  WK["<b>Воркер</b> DNS/PROXIED→HTTP80→ERR=IP BLOCK<br/>TLS1.3+retry • TLS1.2+retry • AVAILABLE/THROTTLED/DPI RESET/DPI BLOCK/IP BLOCK"]
 
-  X["Stop-Script"]
+  EX["<b>EXTRA async</b><br/>DNS/QUIC/TCP16/IpVsSni в runspace<br/>merge ExtraDiag → recommendations • скролл не блокируется"]
+
+  F["Draw-StatusBar / Clear-KeyBuffer → снова цикл"]
+
+  X["Stop-Script<br/>Save-Config • Stop extras • Close ScanRunspacePool • Kill"]
 
   S --> E
   E -.-> N
   E --> L
   L --> H
+  H -->|scroll| SCR
   H -->|Enter| EN
-  H -->|другое| SUB
+  H -->|меню| SUB
   H -->|Q Esc| X
+  SCR --> L
   SUB --> L
   EN -.-> SC
   EN -.-> WK
+  EN -.-> EX
   EN --> F
   F --> L
