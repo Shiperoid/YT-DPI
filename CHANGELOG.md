@@ -37,6 +37,7 @@
 * **Водопад reveal:** paint + sleep только для **видимых** строк viewport (длинный `targets.txt` без паузы на хвост).
 * Placeholder / abort-repaint — только видимое окно (`Get-TableViewportIndexRange`).
 * Post-scan NetInfo при протухшем кэше — **фон** (`Start-BackgroundNetInfoUpdate`), без блокирующего `[ NET ]`.
+* **GEO/DNS:** `ip-api.com` / `ipapi.co` часто **403** — порядок провайдеров: `api.ip.sb` → `ipwhois` → `ipinfo` → `ifconfig` (`asn_org`) → старые API; DNS fallback через `Get-DnsClientServerAddress`.
 
 ### Производительность TUI
 
