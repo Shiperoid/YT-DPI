@@ -17,7 +17,7 @@
 
 **Windows 3.0.1 / TUI v1.5.3** — прокачанный интерфейс под **большие `targets.txt` без лагов**: viewport (NAV/STATUS внизу), быстрая прокрутка без мерцания, скролл сразу после скана (EXTRA в фоне), shared RunspacePool + WaitAny на collect. Полный diff 2.3.3 → 3.0 и патч 3.0.1 — в [CHANGELOG.md](CHANGELOG.md).
 
-![Preview](https://raw.githubusercontent.com/Shiperoid/YT-DPI/refs/heads/master/img/YT-DPI-v3.0.png)
+![Preview](https://raw.githubusercontent.com/Shiperoid/YT-DPI/refs/heads/master/img/YT-DPI-v3.0.1.png)
 
 ---
 
