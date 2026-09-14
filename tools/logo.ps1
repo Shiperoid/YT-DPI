@@ -4,6 +4,10 @@ param(
     [switch] $NoReadKey
 )
 
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+try { [Console]::InputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+try { $OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
 function Get-YtDpiMainScriptPath {
     param([string] $Explicit)
     if ($Explicit -and (Test-Path -LiteralPath $Explicit)) {
@@ -25,13 +29,42 @@ function Get-YtDpiMainScriptPath {
             if (Test-Path -LiteralPath $candidate) {
                 return (Resolve-Path -LiteralPath $candidate).ProviderPath
             }
-            # -LiteralPath с -Parent ломается в части версий pwsh; каталоги здесь без масок — достаточно -Path.
             $parent = Split-Path -Path $dir -Parent
             if (-not $parent -or ($parent -eq $dir)) { break }
             $dir = $parent
         }
     }
     return $null
+}
+
+function Get-ConsoleViewSize {
+    $cw = 0
+    $ch = 0
+    try {
+        $raw = $Host.UI.RawUI
+        $cw = [int]$raw.WindowSize.Width
+        $ch = [int]$raw.WindowSize.Height
+    } catch { }
+    if ($cw -lt 40) {
+        try { $cw = [Console]::WindowWidth } catch { $cw = 120 }
+    }
+    if ($ch -lt 10) {
+        try { $ch = [Console]::WindowHeight } catch { $ch = 30 }
+    }
+    if ($cw -lt 40) { $cw = 120 }
+    if ($ch -lt 10) { $ch = 30 }
+    return [PSCustomObject]@{ W = $cw; H = $ch }
+}
+
+function Out-Str([int] $x, [int] $y, [string] $str, [string] $color = 'White', [string] $bg = 'Black') {
+    try {
+        [Console]::CursorVisible = $false
+        [Console]::SetCursorPosition($x, $y)
+        [Console]::ForegroundColor = $color
+        [Console]::BackgroundColor = $bg
+        [Console]::Write($str)
+        [Console]::BackgroundColor = 'Black'
+    } catch { }
 }
 
 $explicitPath = if ($PSBoundParameters.ContainsKey('SourceScript')) { $SourceScript } else { $null }
@@ -44,17 +77,6 @@ if (-not $SourceScript) {
     }
     Write-Error $hint
     exit 1
-}
-
-function Out-Str([int] $x, [int] $y, [string] $str, [string] $color = 'White', [string] $bg = 'Black') {
-    try {
-        [Console]::CursorVisible = $false
-        [Console]::SetCursorPosition($x, $y)
-        [Console]::ForegroundColor = $color
-        [Console]::BackgroundColor = $bg
-        [Console]::Write($str)
-        [Console]::BackgroundColor = 'Black'
-    } catch { }
 }
 
 if (-not (Test-Path -LiteralPath $SourceScript)) {
@@ -107,29 +129,82 @@ foreach ($r in $rows) {
     }
 }
 
+# Visual width: left at col 0, right at col $gap (same relative layout as in YT-DPI.ps1).
 $blockW = 0
 foreach ($r in $rows) {
-    $w = [Math]::Max($r.Left.Text.Length, $gap + $r.Right.Text.Length)
-    if ($w -gt $blockW) { $blockW = $w }
+    $endCol = [Math]::Max($r.Left.Text.Length, $gap + $r.Right.Text.Length)
+    if ($endCol -gt $blockW) { $blockW = $endCol }
+}
+$blockH = $rows.Count
+
+function Sync-ConsoleBufferToWindow {
+    try {
+        $raw = $Host.UI.RawUI
+        $ws = $raw.WindowSize
+        if ($ws.Width -le 0 -or $ws.Height -le 0) { return }
+        $bs = $raw.BufferSize
+        $needW = [Math]::Max($ws.Width, 1)
+        $needH = [Math]::Max($ws.Height, 1)
+        # Buffer must be >= window; shrink height to window so content stays in view.
+        if ($bs.Width -ne $needW -or $bs.Height -ne $needH) {
+            # Grow first if needed (PS requires buffer >= window when shrinking window).
+            if ($bs.Width -lt $needW -or $bs.Height -lt $needH) {
+                $grow = $bs
+                if ($grow.Width -lt $needW) { $grow.Width = $needW }
+                if ($grow.Height -lt $needH) { $grow.Height = $needH }
+                $raw.BufferSize = $grow
+            }
+            $bs2 = $raw.BufferSize
+            $bs2.Width = $needW
+            $bs2.Height = $needH
+            $raw.BufferSize = $bs2
+        }
+        try { $raw.WindowPosition = New-Object System.Management.Automation.Host.Coordinates 0, 0 } catch { }
+    } catch { }
 }
 
-try {
-    $cw = [Console]::WindowWidth
-    $ch = [Console]::WindowHeight
-} catch {
-    $cw = 120
-    $ch = 40
-}
-$ox = [Math]::Max(0, [int][Math]::Floor(($cw - $blockW) / 2))
-$oy = [Math]::Max(0, [int][Math]::Floor(($ch - $rows.Count) / 2))
-try { Clear-Host } catch { }
-$ri = 0
-foreach ($r in $rows) {
-    Out-Str $ox ($oy + $ri) $r.Left.Text $r.Left.Color
-    Out-Str ($ox + $gap) ($oy + $ri) $r.Right.Text $r.Right.Color
-    $ri++
+function Draw-CenteredLogo {
+    try {
+        [Console]::Title = 'YT-DPI Logo'
+        [Console]::CursorVisible = $false
+    } catch { }
+    Sync-ConsoleBufferToWindow
+    try { Clear-Host } catch { }
+    $view = Get-ConsoleViewSize
+    $ox = [Math]::Max(0, [int][Math]::Floor(($view.W - $blockW) / 2))
+    $oy = [Math]::Max(0, [int][Math]::Floor(($view.H - $blockH) / 2))
+    $ri = 0
+    foreach ($r in $rows) {
+        Out-Str $ox ($oy + $ri) $r.Left.Text $r.Left.Color
+        Out-Str ($ox + $gap) ($oy + $ri) $r.Right.Text $r.Right.Color
+        $ri++
+    }
+    return $view
 }
 
-if (-not $NoReadKey) {
-    try { [void][Console]::ReadKey($true) } catch { }
+# First paint (start "" may open before size is final).
+Start-Sleep -Milliseconds 50
+$view = Draw-CenteredLogo
+$lastW = [int]$view.W
+$lastH = [int]$view.H
+
+if ($NoReadKey) { exit 0 }
+
+# Keep centered while the window is resized (maximize / restore / drag).
+while ($true) {
+    if ([Console]::KeyAvailable) {
+        try { $null = [Console]::ReadKey($true) } catch { }
+        break
+    }
+    $now = Get-ConsoleViewSize
+    if ([int]$now.W -ne $lastW -or [int]$now.H -ne $lastH) {
+        # Debounce rapid resize events.
+        Start-Sleep -Milliseconds 80
+        $now = Get-ConsoleViewSize
+        $view = Draw-CenteredLogo
+        $lastW = [int]$view.W
+        $lastH = [int]$view.H
+    } else {
+        Start-Sleep -Milliseconds 50
+    }
 }
