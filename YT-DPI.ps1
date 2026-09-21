@@ -330,7 +330,7 @@ function Write-DebugLogSessionHeaderIfNeeded {
         Write-DebugLog "Архитектура: OS 64-bit=$([System.Environment]::Is64BitOperatingSystem), процесс PowerShell 64-bit=$([System.Environment]::Is64BitProcess)" "INFO"
     } catch { }
 
-    # ---------- НОВЫЙ БЛОК: статус загрузки целей ----------
+    # ---------- СТАТУС ЗАГРУЗКИ ЦЕЛЕЙ ----------
     if (Get-Variable -Name BaseTargets -Scope Script -ErrorAction SilentlyContinue) {
         $targetsCount = $BaseTargets.Count
         if ($script:CustomTargetsLoaded) {
@@ -1352,13 +1352,29 @@ function Initialize-Targets {
     # Дефолтный список
     Write-DebugLog "Переключение на встроенный (дефолтный) список целей." "INFO"
     $defaultTargets = @(
-        "accounts.google.com", "clients6.google.com", "googlevideo.com",
-        "googleapis.com", "i.ytimg.com", "m.youtube.com", "manifest.googlevideo.com",
-        "music.youtube.com", "play.google.com", "redirector.googlevideo.com",
-        "s.ytimg.com", "s.youtube.com", "signaler-pa.youtube.com", "studio.youtube.com",
-        "tv.youtube.com", "video.google.com", "www.youtube-nocookie.com", "www.youtube.com",
-        "yt3.ggpht.com", "yt4.ggpht.com", "youtu.be", "youtube.com",
-        "youtubeembeddedplayer.googleapis.com", "youtubei.googleapis.com", "youtubekids.com"
+        # --- Основные домены YouTube ---
+        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+        "youtube-nocookie.com", "www.youtube-nocookie.com", "youtubekids.com",
+        "music.youtube.com", "studio.youtube.com", "tv.youtube.com",
+
+        # --- API и сервисы Google (критично для работы приложений) ---
+        "youtubei.googleapis.com", "youtubeembeddedplayer.googleapis.com",
+        "youtube.googleapis.com", "youtubegaming.googleapis.com",
+        "signaler-pa.youtube.com", "jnn-pa.googleapis.com",
+
+        # --- Доставка контента (видео, превью) ---
+        "googlevideo.com", "manifest.googlevideo.com", "redirector.googlevideo.com",
+        "i.ytimg.com", "s.ytimg.com", "i9.ytimg.com",
+        "yt3.ggpht.com", "yt4.ggpht.com", "yt3.googleusercontent.com",
+
+        # --- Инфраструктурные домены Google (часто блокируются в комплексе) ---
+        "googleapis.com", "play.google.com", "accounts.google.com",
+        "clients6.google.com", "video.google.com",
+        "youtube-ui.l.google.com", "ytimg.l.google.com", "ytstatic.l.google.com",
+        "wide-youtube.l.google.com", "yt-video-upload.l.google.com",
+
+        # --- Региональные и вспомогательные (могут понадобиться) ---
+        "youtubeeducation.com"
     )
     $script:BaseTargets = $defaultTargets
     $script:CustomTargetsLoaded = $false
@@ -3333,12 +3349,6 @@ function Draw-UI ($NetInfo, $Targets, $Results, $ClearScreen = $true) {
     [Console]::CursorVisible = $false
     Sync-DynamicColPosFromLayout
     Update-UiConsoleSnapshot
-}
-
-
-function Get-ScanAnim($f, $row) {
-    $frames = "[=   ]", "[ =  ]", "[  = ]", "[   =]", "[  = ]", "[ =  ]"
-    return $frames[($f + $row) % $frames.Length]
 }
 
 function Write-ResultLine {
@@ -6368,13 +6378,8 @@ function Invoke-DnsScanAction {
     Clear-KeyBuffer
 }
 
-
 # ====================================================================================
-# YT-DPI 3.x EXTRA DIAGNOSTICS (inlined - single-file distribution)
-# ====================================================================================
-
-# ====================================================================================
-# YT-DPI 3.0 - EXTRA DIAGNOSTICS (Windows)
+# EXTRA DIAGNOSTICS
 # ====================================================================================
 
 function Test-WarnBypassToolsEnabled {
@@ -7322,7 +7327,6 @@ Draw-StatusBar
 Write-DebugLog "--- СИСТЕМА ГОТОВА ---" "INFO"
 Clear-KeyBuffer
 $FirstRun = $false
-
 
 
 function Start-MainLoop {
