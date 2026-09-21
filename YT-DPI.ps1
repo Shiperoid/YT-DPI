@@ -330,7 +330,7 @@ function Write-DebugLogSessionHeaderIfNeeded {
         Write-DebugLog "Архитектура: OS 64-bit=$([System.Environment]::Is64BitOperatingSystem), процесс PowerShell 64-bit=$([System.Environment]::Is64BitProcess)" "INFO"
     } catch { }
 
-    # ---------- НОВЫЙ БЛОК: статус загрузки целей ----------
+    # ---------- СТАТУС ЗАГРУЗКИ ЦЕЛЕЙ ----------
     if (Get-Variable -Name BaseTargets -Scope Script -ErrorAction SilentlyContinue) {
         $targetsCount = $BaseTargets.Count
         if ($script:CustomTargetsLoaded) {
@@ -689,9 +689,16 @@ public class TlsScanner {
 
                 return "DRP";
             }
-        } catch (Exception ex) {
-            string m = ex.Message.ToLower();
-            if (m.Contains("reset") || m.Contains("closed")) return "RST";
+        } catch (System.Net.Sockets.SocketException sex) {
+            switch (sex.SocketErrorCode) {
+                case System.Net.Sockets.SocketError.ConnectionReset:   return "RST";
+                case System.Net.Sockets.SocketError.TimedOut:          return "TIMEOUT";
+                case System.Net.Sockets.SocketError.ConnectionRefused: return "REFUSED";
+                default: return "DRP";
+            }
+        } catch (System.IO.IOException) {
+            return "DRP";
+        } catch (Exception) {
             return "DRP";
         }
     }
@@ -708,56 +715,55 @@ public class TlsScanner {
 
     private static byte[] BuildModernHello(string host) {
         List<byte> body = new List<byte>();
-        body.AddRange(new byte[] { 0x03, 0x03 }); // TLS 1.2 (for compatibility header)
+        body.AddRange(new byte[] { 0x03, 0x03 }); // legacy_version
 
         byte[] random = new byte[32];
         FillRandomBytes(random);
         body.AddRange(random);
 
-        body.Add(0x00); // Session ID len
-        body.AddRange(new byte[] { 0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03 }); // Ciphers: TLS_AES_128_GCM_SHA256 и др.
-        body.Add(0x20); // Length 32
-        byte[] sessId = new byte[32]; FillRandomBytes(sessId);
-        body.AddRange(sessId);
+        body.Add(0x00); // legacy_session_id length = 0
+
+        // Cipher Suites
+        body.AddRange(new byte[] { 0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03 });
+
+        // Compression Methods
+        body.Add(0x01);
+        body.Add(0x00);
 
         List<byte> exts = new List<byte>();
 
-        // 1. SNI
+        // SNI
         byte[] h = Encoding.ASCII.GetBytes(host);
-        exts.AddRange(new byte[] { 0x00, 0x00 }); // Type SNI
+        exts.AddRange(new byte[] { 0x00, 0x00 });
         int sniLen = h.Length + 5;
         exts.Add((byte)(sniLen >> 8)); exts.Add((byte)(sniLen & 0xFF));
         exts.Add((byte)((h.Length + 3) >> 8)); exts.Add((byte)((h.Length + 3) & 0xFF));
-        exts.Add(0x00); // Name type: host_name
+        exts.Add(0x00);
         exts.Add((byte)(h.Length >> 8)); exts.Add((byte)(h.Length & 0xFF));
         exts.AddRange(h);
 
-        // 2. Extended Master Secret (0x0017)
+        // Extended Master Secret
         exts.AddRange(new byte[] { 0x00, 0x17, 0x00, 0x00 });
-
-        // 3. Supported Groups (0x000a) - x25519
+        // Supported Groups (x25519)
         exts.AddRange(new byte[] { 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d });
-
-        // 4. Signature Algorithms (0x000d) - КРИТИЧНО ДЛЯ GOOGLE
-        // ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, rsa_pkcs1_sha256
+        // Signature Algorithms
         exts.AddRange(new byte[] { 0x00, 0x0d, 0x00, 0x08, 0x00, 0x06, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01 });
-
-        // 5. Supported Versions (0x002b) - TLS 1.3
+        // Supported Versions (TLS 1.3)
         exts.AddRange(new byte[] { 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 });
-
-        // 6. PSK Key Exchange Modes (0x002d) - КРИТИЧНО ДЛЯ TLS 1.3
+        // PSK Key Exchange Modes
         exts.AddRange(new byte[] { 0x00, 0x2d, 0x00, 0x02, 0x01, 0x01 });
-
-        // 7. Key Share (0x0033)
+        // Key Share (x25519)
         exts.AddRange(new byte[] { 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 });
         byte[] key = new byte[32]; FillRandomBytes(key);
         exts.AddRange(key);
 
-        body.Add((byte)(exts.Count >> 8)); body.Add((byte)(exts.Count & 0xFF));
+        body.Add((byte)(exts.Count >> 8));
+        body.Add((byte)(exts.Count & 0xFF));
         body.AddRange(exts);
 
-        List<byte> pkt = new List<byte> { 0x16, 0x03, 0x01 }; // Record Header
-        pkt.Add((byte)(body.Count >> 8)); pkt.Add((byte)(body.Count & 0xFF));
+        List<byte> pkt = new List<byte> { 0x16, 0x03, 0x01 };
+        pkt.Add((byte)(body.Count >> 8));
+        pkt.Add((byte)(body.Count & 0xFF));
         pkt.AddRange(body);
         return pkt.ToArray();
     }
@@ -1040,32 +1046,6 @@ function Get-GeoProviderDefinitions {
             Check  = { param($j) -not $j.error -and $j.org -and $j.country }
             GetISP = { param($j) ($j.org -split '\s+', 3)[0..1] -join ' ' }
             GetLOC = { param($j) "$($j.city), $($j.country)" }
-        }
-        [PSCustomObject]@{
-            Name   = "ifconfig.co"
-            Url    = "https://ifconfig.co/json"
-            Check  = { param($j) ($j.asn_org -or $j.org) -and ($j.country_iso -or $j.country) }
-            GetISP = { param($j) if ($j.asn_org) { $j.asn_org } else { $j.org } }
-            GetLOC = {
-                param($j)
-                $city = if ($j.city) { [string]$j.city } else { "" }
-                $cc = if ($j.country_iso) { [string]$j.country_iso } elseif ($j.country) { [string]$j.country } else { "" }
-                if ($city) { "$city, $cc" } else { $cc }
-            }
-        }
-        [PSCustomObject]@{
-            Name   = "ip-api.com"
-            Url    = "https://ip-api.com/json/?fields=status,countryCode,city,isp"
-            Check  = { param($j) $j.status -eq "success" -and $j.isp }
-            GetISP = { param($j) $j.isp }
-            GetLOC = { param($j) "$($j.city), $($j.countryCode)" }
-        }
-        [PSCustomObject]@{
-            Name   = "ipapi.co"
-            Url    = "https://ipapi.co/json/"
-            Check  = { param($j) -not $j.error -and $j.org -and $j.country_code }
-            GetISP = { param($j) $j.org }
-            GetLOC = { param($j) "$($j.city), $($j.country_code)" }
         }
     )
 }
@@ -1372,13 +1352,29 @@ function Initialize-Targets {
     # Дефолтный список
     Write-DebugLog "Переключение на встроенный (дефолтный) список целей." "INFO"
     $defaultTargets = @(
-        "accounts.google.com", "clients6.google.com", "googlevideo.com",
-        "googleapis.com", "i.ytimg.com", "m.youtube.com", "manifest.googlevideo.com",
-        "music.youtube.com", "play.google.com", "redirector.googlevideo.com",
-        "s.ytimg.com", "s.youtube.com", "signaler-pa.youtube.com", "studio.youtube.com",
-        "tv.youtube.com", "video.google.com", "www.youtube-nocookie.com", "www.youtube.com",
-        "yt3.ggpht.com", "yt4.ggpht.com", "youtu.be", "youtube.com",
-        "youtubeembeddedplayer.googleapis.com", "youtubei.googleapis.com", "youtubekids.com"
+        # --- Основные домены YouTube ---
+        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+        "youtube-nocookie.com", "www.youtube-nocookie.com", "youtubekids.com",
+        "music.youtube.com", "studio.youtube.com", "tv.youtube.com",
+
+        # --- API и сервисы Google (критично для работы приложений) ---
+        "youtubei.googleapis.com", "youtubeembeddedplayer.googleapis.com",
+        "youtube.googleapis.com", "youtubegaming.googleapis.com",
+        "signaler-pa.youtube.com", "jnn-pa.googleapis.com",
+
+        # --- Доставка контента (видео, превью) ---
+        "googlevideo.com", "manifest.googlevideo.com", "redirector.googlevideo.com",
+        "i.ytimg.com", "s.ytimg.com", "i9.ytimg.com",
+        "yt3.ggpht.com", "yt4.ggpht.com", "yt3.googleusercontent.com",
+
+        # --- Инфраструктурные домены Google (часто блокируются в комплексе) ---
+        "googleapis.com", "play.google.com", "accounts.google.com",
+        "clients6.google.com", "video.google.com",
+        "youtube-ui.l.google.com", "ytimg.l.google.com", "ytstatic.l.google.com",
+        "wide-youtube.l.google.com", "yt-video-upload.l.google.com",
+
+        # --- Региональные и вспомогательные (могут понадобиться) ---
+        "youtubeeducation.com"
     )
     $script:BaseTargets = $defaultTargets
     $script:CustomTargetsLoaded = $false
@@ -3353,12 +3349,6 @@ function Draw-UI ($NetInfo, $Targets, $Results, $ClearScreen = $true) {
     [Console]::CursorVisible = $false
     Sync-DynamicColPosFromLayout
     Update-UiConsoleSnapshot
-}
-
-
-function Get-ScanAnim($f, $row) {
-    $frames = "[=   ]", "[ =  ]", "[  = ]", "[   =]", "[  = ]", "[ =  ]"
-    return $frames[($f + $row) % $frames.Length]
 }
 
 function Write-ResultLine {
@@ -6388,13 +6378,8 @@ function Invoke-DnsScanAction {
     Clear-KeyBuffer
 }
 
-
 # ====================================================================================
-# YT-DPI 3.x EXTRA DIAGNOSTICS (inlined - single-file distribution)
-# ====================================================================================
-
-# ====================================================================================
-# YT-DPI 3.0 - EXTRA DIAGNOSTICS (Windows)
+# EXTRA DIAGNOSTICS
 # ====================================================================================
 
 function Test-WarnBypassToolsEnabled {
@@ -7342,7 +7327,6 @@ Draw-StatusBar
 Write-DebugLog "--- СИСТЕМА ГОТОВА ---" "INFO"
 Clear-KeyBuffer
 $FirstRun = $false
-
 
 
 function Start-MainLoop {
