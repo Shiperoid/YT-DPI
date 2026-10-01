@@ -1,4 +1,4 @@
-﻿$script:OriginalFilePath = [System.Environment]::GetEnvironmentVariable("SCRIPT_PATH", "Process")
+$script:OriginalFilePath = [System.Environment]::GetEnvironmentVariable("SCRIPT_PATH", "Process")
 if (-not $script:OriginalFilePath) { $script:OriginalFilePath = $MyInvocation.MyCommand.Path }
 if (-not $script:OriginalFilePath) { $script:OriginalFilePath = $MyInvocation.InvocationName }
 
@@ -210,18 +210,27 @@ if ($script:BatchMode -and -not $script:TxtReportPath) {
     $script:TxtReportPath = Join-Path $script:ParentDirForReports $CONST.Batch.DefaultTxtName
 }
 
+# ===== ФИНАЛЬНЫЙ ПУТЬ К ЛОГУ (папка скрипта, не CWD) =====
+$script:ParentDir = Split-Path -Parent $script:OriginalFilePath
+if (-not $script:ParentDir) { $script:ParentDir = (Get-Location).Path }
+$DebugLogFile = Join-Path $script:ParentDir "YT-DPI_Debug.log"
+
 # ===== ЛОГИРОВАНИЕ И РОТАЦИЯ =====
 $maxLogSizeBytes = 5 * 1024 * 1024
-if (Test-Path $DebugLogFile) {
+if (Test-Path -LiteralPath $DebugLogFile) {
     try {
-        $fileInfo = Get-Item $DebugLogFile
+        $fileInfo = Get-Item -LiteralPath $DebugLogFile
         if ($fileInfo.Length -gt $maxLogSizeBytes) {
             $backupName = [System.IO.Path]::GetFileNameWithoutExtension($DebugLogFile) + "_" + (Get-Date -Format 'yyyyMMdd_HHmmss') + ".log"
-            Move-Item $DebugLogFile (Join-Path (Split-Path $DebugLogFile -Parent) $backupName) -Force
+            $backupPath = Join-Path $script:ParentDir $backupName
+            Move-Item -LiteralPath $DebugLogFile -Destination $backupPath -Force
+            Write-Host "[ LOG ] Ротация: $backupName" -ForegroundColor DarkGray
         } else {
-            Remove-Item $DebugLogFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $DebugLogFile -Force -ErrorAction SilentlyContinue
         }
-    } catch { Remove-Item $DebugLogFile -Force -ErrorAction SilentlyContinue }
+    } catch {
+        Remove-Item -LiteralPath $DebugLogFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-DebugLogEnabled {
@@ -713,6 +722,172 @@ public class TlsScanner {
         return req.ToArray();
     }
 
+	public static string TestT12(string targetIp, string host, string proxyHost, int proxyPort, string user, string pass, int timeout) {
+        try {
+            using (TcpClient tcp = new TcpClient()) {
+                string connectHost = string.IsNullOrEmpty(proxyHost) ? targetIp : proxyHost;
+                int connectPort = string.IsNullOrEmpty(proxyHost) ? 443 : proxyPort;
+
+                var ar = tcp.BeginConnect(connectHost, connectPort, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(timeout)) return "DRP";
+                tcp.EndConnect(ar);
+
+                NetworkStream stream = tcp.GetStream();
+                stream.ReadTimeout = timeout;
+                stream.WriteTimeout = timeout;
+
+                if (!string.IsNullOrEmpty(proxyHost)) {
+                    byte[] greeting = new byte[] { 0x05, 0x01, 0x00 };
+                    stream.Write(greeting, 0, greeting.Length);
+                    byte[] authResp = new byte[2];
+                    if (!ReadExactly(stream, authResp, 2)) return "DRP";
+
+                    byte[] connectReq = BuildSocksConnect(host, 443);
+                    stream.Write(connectReq, 0, connectReq.Length);
+                    byte[] connResp = new byte[10];
+                    if (!ReadExactly(stream, connResp, 10)) return "DRP";
+                    if (connResp[1] != 0x00) return "PRX_ERR";
+                }
+
+                byte[] hello = BuildTls12Hello(host);
+                stream.Write(hello, 0, hello.Length);
+
+                // Читаем 5 байт заголовка с циклом — TCP может вернуть частями
+                byte[] header = new byte[5];
+                int read = 0;
+                while (read < 5) {
+                    int n;
+                    try { n = stream.Read(header, read, 5 - read); }
+                    catch (System.IO.IOException ex) {
+                        string m = ex.Message.ToLower();
+                        if (m.Contains("reset") || m.Contains("сброс")) return "RST";
+                        return "DRP";
+                    }
+                    if (n <= 0) return "DRP";
+                    read += n;
+                }
+
+                if (header[0] == 0x16) return "OK";   // ServerHello
+                if (header[0] == 0x15) return "OK";   // Alert — сервер ответил, но не согласен
+                return "DRP";
+            }
+        } catch (System.Net.Sockets.SocketException sex) {
+            switch (sex.SocketErrorCode) {
+                case System.Net.Sockets.SocketError.ConnectionReset:   return "RST";
+                case System.Net.Sockets.SocketError.TimedOut:          return "TIMEOUT";
+                case System.Net.Sockets.SocketError.ConnectionRefused: return "REFUSED";
+                default: return "DRP";
+            }
+        } catch (System.IO.IOException) {
+            return "DRP";
+        } catch (Exception) {
+            return "DRP";
+        }
+    }
+
+    // Читает ровно count байт или возвращает false
+    private static bool ReadExactly(NetworkStream stream, byte[] buf, int count) {
+        int read = 0;
+        while (read < count) {
+            int n = stream.Read(buf, read, count - read);
+            if (n <= 0) return false;
+            read += n;
+        }
+        return true;
+    }
+
+    private static byte[] BuildTls12Hello(string host) {
+        List<byte> body = new List<byte>();
+
+        // client_version: TLS 1.2
+        body.AddRange(new byte[] { 0x03, 0x03 });
+
+        // random: 32 байта
+        byte[] random = new byte[32];
+        FillRandomBytes(random);
+        body.AddRange(random);
+
+        // session_id: пусто (как делает большинство современных клиентов)
+        body.Add(0x00);
+
+        // Cipher Suites — от современных AEAD к legacy fallback
+        List<byte> ciphers = new List<byte>();
+        ciphers.AddRange(new byte[] { 0xC0, 0x2B }); // ECDHE_ECDSA_AES128_GCM_SHA256
+        ciphers.AddRange(new byte[] { 0xC0, 0x2F }); // ECDHE_RSA_AES128_GCM_SHA256
+        ciphers.AddRange(new byte[] { 0xC0, 0x30 }); // ECDHE_RSA_AES256_GCM_SHA384
+        ciphers.AddRange(new byte[] { 0xC0, 0x2C }); // ECDHE_ECDSA_AES256_GCM_SHA384
+        ciphers.AddRange(new byte[] { 0x00, 0x9E }); // DHE_RSA_AES128_GCM_SHA256
+        ciphers.AddRange(new byte[] { 0x00, 0x9C }); // RSA_AES128_GCM_SHA256
+        ciphers.AddRange(new byte[] { 0xC0, 0x13 }); // ECDHE_RSA_AES128_CBC_SHA
+        ciphers.AddRange(new byte[] { 0xC0, 0x14 }); // ECDHE_RSA_AES256_CBC_SHA
+        ciphers.AddRange(new byte[] { 0x00, 0x2F }); // RSA_AES128_CBC_SHA
+        ciphers.AddRange(new byte[] { 0x00, 0x35 }); // RSA_AES256_CBC_SHA
+
+        body.Add((byte)(ciphers.Count >> 8));
+        body.Add((byte)(ciphers.Count & 0xFF));
+        body.AddRange(ciphers);
+
+        // compression_methods: только null
+        body.Add(0x01);
+        body.Add(0x00);
+
+        // Extensions
+        List<byte> exts = new List<byte>();
+
+        // SNI (0x0000)
+        byte[] h = Encoding.ASCII.GetBytes(host);
+        exts.AddRange(new byte[] { 0x00, 0x00 });
+        int sniExtLen = h.Length + 5;
+        exts.Add((byte)(sniExtLen >> 8)); exts.Add((byte)(sniExtLen & 0xFF));
+        exts.Add((byte)((h.Length + 3) >> 8)); exts.Add((byte)((h.Length + 3) & 0xFF));
+        exts.Add(0x00);
+        exts.Add((byte)(h.Length >> 8)); exts.Add((byte)(h.Length & 0xFF));
+        exts.AddRange(h);
+
+        // Extended Master Secret (0x0017) — многие серверы без него отказываются
+        exts.AddRange(new byte[] { 0x00, 0x17, 0x00, 0x00 });
+
+        // Renegotiation Info (0xFF01) — пустой
+        exts.AddRange(new byte[] { 0xFF, 0x01, 0x00, 0x01, 0x00 });
+
+        // Supported Groups: x25519 + secp256r1 + secp384r1
+        exts.AddRange(new byte[] { 0x00, 0x0A, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1D, 0x00, 0x17 });
+
+        // EC Point Formats: uncompressed
+        exts.AddRange(new byte[] { 0x00, 0x0B, 0x00, 0x02, 0x01, 0x00 });
+
+        // Signature Algorithms (0x000D) — 8 алгоритмов
+        exts.AddRange(new byte[] {
+            0x00, 0x0D, 0x00, 0x14, 0x00, 0x12,
+            0x04, 0x01, 0x04, 0x03, 0x08, 0x04, 0x05, 0x01,
+            0x05, 0x03, 0x08, 0x05, 0x02, 0x01, 0x02, 0x03
+        });
+
+        // Session Ticket (0x0023) — пустой, обязателен на некоторых серверах
+        exts.AddRange(new byte[] { 0x00, 0x23, 0x00, 0x00 });
+
+        body.Add((byte)(exts.Count >> 8));
+        body.Add((byte)(exts.Count & 0xFF));
+        body.AddRange(exts);
+
+        // Record layer + Handshake header
+        int bodyLen = body.Count;
+        int recordLen = bodyLen + 4;   // +4 на handshake header
+
+        List<byte> pkt = new List<byte>();
+        pkt.Add(0x16);                     // Handshake
+        pkt.Add(0x03); pkt.Add(0x01);      // Record version TLS 1.0 (как в браузерах)
+        pkt.Add((byte)(recordLen >> 8));
+        pkt.Add((byte)(recordLen & 0xFF));
+        pkt.Add(0x01);                     // ClientHello
+        pkt.Add((byte)((bodyLen >> 16) & 0xFF));
+        pkt.Add((byte)((bodyLen >> 8) & 0xFF));
+        pkt.Add((byte)(bodyLen & 0xFF));
+        pkt.AddRange(body);
+
+        return pkt.ToArray();
+    }
+
     private static byte[] BuildModernHello(string host) {
         List<byte> body = new List<byte>();
         body.AddRange(new byte[] { 0x03, 0x03 }); // legacy_version
@@ -797,9 +972,7 @@ function Ensure-TlsScannerLoaded {
 }
 
 # --- ГЛОБАЛЬНЫЕ ПУТИ ---
-# Лог кладем строго в папку, где лежит сам файл .bat
-$script:ParentDir = Split-Path -Parent $script:OriginalFilePath
-$DebugLogFile = Join-Path $script:ParentDir "YT-DPI_Debug.log"
+# Лог уже настроен выше в блоке ротации.
 # При отладке через env — заголовок сразу в финальный путь к логу (до Load-Config конфиг в логе ещё не виден)
 if ($DEBUG_ENABLED) { Write-DebugLogSessionHeaderIfNeeded }
 
@@ -1403,6 +1576,7 @@ function Get-Targets {
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И UI
 # ====================================================================================
 function Out-Str($x, $y, $str, $color="White", $bg="Black") {
+	if ($script:UiDrawBlocked) { return }
     try {
         if ($x -lt 0 -or $y -lt 0) { return }
         $ww = [Console]::WindowWidth
@@ -1435,6 +1609,7 @@ $script:UiFrame = $null
 $script:UiFrameDirty = $false
 $script:LatBarMaxMs = 1
 $script:UiCursorHidden = $false
+$script:UiDrawBlocked = $false
 
 function New-UiFrame {
     param([int]$Width, [int]$Height)
@@ -2778,34 +2953,66 @@ function Invoke-ScanRedrawIfConsoleResized {
         [string]$StatusBarMessage = $null,
         [double]$Progress = -1
     )
-    $resized = Test-ScanPhaseConsoleLayoutChanged
-    if ($resized) {
-        Write-DebugLog "Ресайз во время скана — полная перерисовка (Clear)" "INFO"
+
+    $cw = 0; $ch = 0
+    try { $cw = [Console]::WindowWidth; $ch = [Console]::WindowHeight } catch { return }
+
+    # Первый кадр — зафиксировать снимок
+    if ($null -eq $script:ScanLayoutSnapW -or $null -eq $script:ScanLayoutSnapH) {
+        $script:ScanLayoutSnapW = $cw
+        $script:ScanLayoutSnapH = $ch
+    }
+
+    $sizeChanged = ($cw -ne $script:ScanLayoutSnapW -or $ch -ne $script:ScanLayoutSnapH)
+
+    if ($sizeChanged) {
+        $now      = [Environment]::TickCount64
+        $debounce = Get-UiResizeDebounceMs
+
+        # Размер всё ещё меняется (идёт drag/ресайз) — блокируем весь вывод
+        if ($null -eq $script:ResizePendingSince -or
+            $cw -ne $script:ResizePendingW -or
+            $ch -ne $script:ResizePendingH) {
+            $script:ResizePendingSince = $now
+            $script:ResizePendingW     = $cw
+            $script:ResizePendingH     = $ch
+            $script:UiDrawBlocked      = $true
+            return
+        }
+        if (($now - $script:ResizePendingSince) -lt $debounce) {
+            $script:UiDrawBlocked = $true
+            return
+        }
+
+        # Размер устоялся — снимаем блок, делаем полный редрайв
+        $script:UiDrawBlocked      = $false
         $script:ResizePendingSince = $null
+        Write-DebugLog "Scan resize settled -> full redraw" "INFO"
+
         Update-ConsoleSize
         $null = Clamp-TableScroll -TargetCount $(if ($Targets) { $Targets.Count } else { 0 })
         if ($LiveResults) { Update-LatBarScale -Results $LiveResults }
         Draw-UI $script:NetInfo $Targets $LiveResults $true
         Sync-DynamicColPosFromLayout
         Clear-StatusBlock
+
         try {
             $script:ScanLayoutSnapW = [Console]::WindowWidth
             $script:ScanLayoutSnapH = [Console]::WindowHeight
         } catch {}
         Update-UiConsoleSnapshot
     }
+    else {
+        # Размер совпадает со снимком — рисовать можно
+        $script:UiDrawBlocked = $false
+    }
+
     if ($null -ne $Progress -and $Progress -ge 0) {
         $msg = if ($StatusBarMessage) { $StatusBarMessage } else { "[ SCAN ]" }
         Draw-StatusBar -Message $msg -Fg "Black" -Bg "Green" -Progress $Progress
-        Update-UiConsoleSnapshot
     }
-    elseif ($resized) {
-        if ($StatusBarMessage) {
-            Draw-StatusBar -Message $StatusBarMessage -Fg "Black" -Bg "Green"
-        } else {
-            Draw-StatusBar
-        }
-        Update-UiConsoleSnapshot
+    elseif ($StatusBarMessage) {
+        Draw-StatusBar -Message $StatusBarMessage -Fg "Black" -Bg "Green"
     }
 }
 
@@ -3515,7 +3722,21 @@ function Stop-Script {
     try { Stop-DeferredPostScanExtras } catch { }
     try { Close-ScanRunspacePool } catch { }
 
-    # 3. Убиваем процесс
+    # 3. Очищаем экран как cls: сбрасываем цвета, сбрасываем позицию курсора
+    #    и заливаем буфер текущим фоном
+    try {
+        [Console]::ResetColor()
+        [Console]::BackgroundColor = "Black"
+        [Console]::ForegroundColor = "Gray"
+        try { [Console]::SetCursorPosition(0, 0) } catch { }
+        [Console]::Clear()
+    } catch {
+        # Если Clear упал (например, из-за нестандартного хоста консоли),
+        # хотя бы попробуем стандартный путь
+        try { Clear-Host } catch { }
+    }
+
+    # 4. Убиваем процесс
     [System.Diagnostics.Process]::GetCurrentProcess().Kill()
 }
 
@@ -5551,11 +5772,24 @@ $Worker = {
         }
 
         if ($consider12) {
-            $hFirst = Invoke-Tls12HandshakeOnce -TimeoutMs $TlsTimeoutFast
-            $Result.T12 = $hFirst.Cell
-            if ($hFirst.RstPhase) { $Result.RstPhase12 = $hFirst.RstPhase }
-            elseif ($Result.T12 -eq "RST") { $Result.RstPhase12 = "RST_CH" }
-            $t12TimedOut = $hFirst.TimedOut
+			$useRawT12 = (-not $ProxyConfig.Enabled) -or ($ProxyConfig.Type -eq "SOCKS5")
+			if ($useRawT12) {
+				# Сырой C#-движок: не зависит от SChannel, работает и на Win10
+				$rawCell = [TlsScanner]::TestT12($Result.IP, $Target, $pHost, $pPort, $ProxyConfig.User, $ProxyConfig.Pass, $TlsTimeoutFast)
+				$Result.T12 = $rawCell
+				if ($rawCell -eq "RST") { $Result.RstPhase12 = "RST_CH" }
+				elseif ($rawCell -eq "DRP" -or $rawCell -eq "TIMEOUT") { $Result.RstPhase12 = "DPI_T12" }
+				$t12TimedOut = ($rawCell -eq "DRP" -or $rawCell -eq "TIMEOUT")
+				Write-DebugLog "TLS T12 : [RAW] Host=$Target Result=$rawCell Phase=$($Result.RstPhase12)"   
+			} else {
+				# HTTP-прокси: C#-часть не умеет HTTP CONNECT — используем PS SslStream
+				Write-DebugLog "TLS T12 : [SSL] Host=$Target (proxy=$($ProxyConfig.Type))"  
+				$hFirst = Invoke-Tls12HandshakeOnce -TimeoutMs $TlsTimeoutFast
+				$Result.T12 = $hFirst.Cell
+				if ($hFirst.RstPhase) { $Result.RstPhase12 = $hFirst.RstPhase }
+				elseif ($Result.T12 -eq "RST") { $Result.RstPhase12 = "RST_CH" }
+				$t12TimedOut = $hFirst.TimedOut
+			}
         } else {
             $Result.T12 = "N/A"
             Write-DebugLog "TLS T12: пропущено (режим TLS13)"
@@ -5565,12 +5799,23 @@ $Worker = {
     # Retry при timeout T12: в Auto — только если T13 OK; в режиме только TLS12 — всегда при timeout
     $doT12Retry = $t12TimedOut -and $consider12 -and (($consider13 -and $Result.T13 -eq "OK") -or (-not $consider13))
     if ($doT12Retry) {
-        Write-DebugLog "TLS T12: retry после timeout ($TlsTimeoutRetry ms)" "INFO"
-        $hRetry = Invoke-Tls12HandshakeOnce -TimeoutMs $TlsTimeoutRetry
-        $Result.T12 = $hRetry.Cell
-        if ($hRetry.RstPhase) { $Result.RstPhase12 = $hRetry.RstPhase }
-        elseif ($Result.T12 -eq "RST") { $Result.RstPhase12 = "RST_CH" }
-    }
+		Write-DebugLog "TLS T12: retry после timeout ($TlsTimeoutRetry ms)" "INFO"
+		if ($useRawT12) {
+			Write-DebugLog "TLS T12 retry [RAW] ($TlsTimeoutRetry ms)" "INFO"
+			$retryCell = [TlsScanner]::TestT12($Result.IP, $Target, $pHost, $pPort, $ProxyConfig.User, $ProxyConfig.Pass, $TlsTimeoutRetry)
+			Write-DebugLog "TLS T12 retry [RAW] -> $retryCell" "INFO"
+			if ($retryCell -eq "OK" -or $retryCell -eq "RST") {
+				$Result.T12 = $retryCell
+				if ($retryCell -eq "RST") { $Result.RstPhase12 = "RST_CH" }
+			}
+		} else {
+			Write-DebugLog "TLS T12 retry [SSL] ($TlsTimeoutRetry ms)" "INFO"
+			$hRetry = Invoke-Tls12HandshakeOnce -TimeoutMs $TlsTimeoutRetry
+			$Result.T12 = $hRetry.Cell
+			if ($hRetry.RstPhase) { $Result.RstPhase12 = $hRetry.RstPhase }
+			elseif ($Result.T12 -eq "RST") { $Result.RstPhase12 = "RST_CH" }
+		}
+	}
 
     $auxVerdictT13 = $null
     $auxVerdictT12 = $null
@@ -6034,6 +6279,7 @@ function Start-ScanWithAnimation($Targets, $ProxyConfig, [bool]$PlaceholderRowsV
     $script:ScanLayoutSnapW = $null
     $script:ScanLayoutSnapH = $null
     $script:ResizePendingSince = $null
+	$script:UiDrawBlocked    = $false
     Update-UiConsoleSnapshot
     return [PSCustomObject]@{
         Results = $returnResults
@@ -6231,9 +6477,12 @@ function Start-QuickNetInfoUpdater {
 
 function Update-TargetsBeforeScan {
     # Используем кэш только если это не заглушка Loading/Unknown.
-    if (Test-NetInfoUsable $script:Config.NetCache) {
-        $script:NetInfo = $script:Config.NetCache
-    }
+    $cur = $script:NetInfo
+	$cfg = $script:Config.NetCache
+	if ((Test-NetInfoUsable $cfg) -and
+		((!$cur) -or ($cfg.TimestampTicks -gt $cur.TimestampTicks))) {
+		$script:NetInfo = $cfg
+	}
 
     # Проверяем, не пора ли обновить кэш в фоне
     $cacheAge = (Get-Date).Ticks - $script:NetInfo.TimestampTicks
@@ -6267,30 +6516,41 @@ function Update-TargetsBeforeScan {
 
 function Update-NetInfoFromCompletedJob {
     $bgJob = Get-Job -Name "NetInfoUpdater" -ErrorAction SilentlyContinue
-    if ($bgJob -and $bgJob.State -eq "Completed") {
-        $newNetInfo = Receive-Job $bgJob
-        Remove-Job $bgJob
-        $script:NetInfoUpdating = $false
-        if ($newNetInfo -and (Test-NetInfoUsable $newNetInfo)) {
-            Write-DebugLog "NetInfo обновлен в фоне, обновляем UI" "INFO"
-            $null = Set-NetInfoCacheIfUsable $newNetInfo
-            $oldTargetsKey = if ($script:Targets) { (@($script:Targets) -join "`n") } else { "" }
-            $script:NetInfo = $newNetInfo
-            $script:Targets = Get-Targets -NetInfo $script:NetInfo
-            $newTargetsKey = if ($script:Targets) { (@($script:Targets) -join "`n") } else { "" }
-            Save-Config $script:Config
-            if (-not $script:HasCompletedScan) {
-                if ($oldTargetsKey -ne $newTargetsKey) {
-                    Draw-UI $script:NetInfo $script:Targets $null $false
-                } else {
-                    Update-NetInfoPanel $script:NetInfo
-                }
-                Draw-StatusBar
-                return
-            }
+    if (-not $bgJob) { return }
+
+    # Failed/Stopped тоже нужно обрабатывать — иначе NetInfoUpdating навсегда останется $true
+    if ($bgJob.State -notin @("Completed", "Failed", "Stopped")) { return }
+
+    $newNetInfo = $null
+    if ($bgJob.State -eq "Completed") {
+        try { $newNetInfo = Receive-Job $bgJob } catch { $newNetInfo = $null }
+    }
+
+    try { Remove-Job $bgJob -Force -ErrorAction SilentlyContinue } catch { }
+    $script:NetInfoUpdating = $false
+
+    if (-not $newNetInfo) { return }
+    if (-not (Test-NetInfoUsable $newNetInfo)) { return }
+
+    Write-DebugLog "NetInfo обновлен в фоне, обновляем UI" "INFO"
+    $null = Set-NetInfoCacheIfUsable $newNetInfo
+
+    $oldTargetsKey = if ($script:Targets) { (@($script:Targets) -join "`n") } else { "" }
+    $script:NetInfo = $newNetInfo
+    $script:Targets = Get-Targets -NetInfo $script:NetInfo
+    $newTargetsKey = if ($script:Targets) { (@($script:Targets) -join "`n") } else { "" }
+    Save-Config $script:Config
+
+    if (-not $script:HasCompletedScan) {
+        if ($oldTargetsKey -ne $newTargetsKey) {
+            Draw-UI $script:NetInfo $script:Targets $null $false
+        } else {
             Update-NetInfoPanel $script:NetInfo
         }
+        Draw-StatusBar
+        return
     }
+    Update-NetInfoPanel $script:NetInfo
 }
 
 function Save-ScanReport {
