@@ -26,7 +26,7 @@ for ($__i = 0; $__i -lt $script:CliArgs.Count; $__i++) {
         }
         '^--report=(.+)$' { $script:TxtReportPath = $Matches[1]; continue }
         '^--help$|^-h$' {
-            Write-Host "YT-DPI 3.0.1 — usage:"
+            Write-Host "YT-DPI 3.0.2 — usage:"
             Write-Host "  YT-DPI.bat [--batch] [--no-extras] [--json path] [--report path]"
             Write-Host "  --batch       headless suite (scan + extras), write reports, exit 0/1/2"
             Write-Host "  --no-extras   domain scan only (skip QUIC/DNS/TCP16/IpVsSni)"
@@ -68,7 +68,7 @@ if ($script:AllowInsecureTls) {
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 100
 
-$scriptVersion = "3.0.1"   # YT-DPI 3.0.1 (Windows)
+$scriptVersion = "3.0.2"
 # ===== ОТЛАДКА =====
 $debugEnvRaw = [System.Environment]::GetEnvironmentVariable("YT_DPI_DEBUG", "Process")
 if (-not $debugEnvRaw) { $debugEnvRaw = [System.Environment]::GetEnvironmentVariable("YT_DPI_DEBUG", "User") }
@@ -87,8 +87,8 @@ $script:DebugLogMutexName = "Global\YT-DPI-Debug-Mutex"
 $DebugLogMutex = New-Object System.Threading.Mutex($false, $script:DebugLogMutexName)
 
 $SCRIPT:CONST = @{
-    TimeoutMs    = 700       # Снижено с 1500
-    ProxyTimeout = 1200      # Снижено с 2500
+    TimeoutMs    = 700
+    ProxyTimeout = 1200
     HttpPort     = 80
     HttpsPort    = 443
     Tls13Proto   = 12288
@@ -97,47 +97,47 @@ $SCRIPT:CONST = @{
     ScanPoolDirectMax     = 24
     ScanPoolProxyMax      = 12
     ScanPoolCpuMultiplier = 3
-    Mutex = @{ WaitMs = 7000 }   # Снижено с 15000
+    Mutex = @{ WaitMs = 7000 }
     Scan = @{
-        HttpDirectCapMs       = 600    # Снижено с 1200
-        TlsFastMsDirect       = 800    # Снижено с 1600
-        TlsFastMsProxy        = 1200   # Снижено с 2200
-        TlsRetryMsDirect      = 1300   # Снижено с 2600
-        TlsRetryMsProxyFloor  = 1300   # Снижено с 2600
+        HttpDirectCapMs       = 600
+        TlsFastMsDirect       = 800
+        TlsFastMsProxy        = 1200
+        TlsRetryMsDirect      = 1300
+        TlsRetryMsProxyFloor  = 1300
     }
     NetInfo = @{
-        WebFastDefaultMs      = 1000   # Снижено с 3000
-        RedirectorMs          = 700    # Снижено с 2000
-        GeoPerRequestMs       = 500    # Снижено с 1500
-        Ipv6ProbeWaitMs       = 350    # Снижено с 1000
-        RedirectorRequestMs   = 700    # Снижено с 3000
+        WebFastDefaultMs      = 1000
+        RedirectorMs          = 700
+        GeoPerRequestMs       = 500
+        Ipv6ProbeWaitMs       = 350
+        RedirectorRequestMs   = 700
     }
     ProxySelfTest = @{
-        DetectTcpConnectMs = 700     # Снижено с 2000
-        DetectStreamRwMs   = 800     # Снижено с 2000
-        QuickTunnelMs      = 2000    # Снижено с 5000
-        TcpToProxyMs       = 1500    # Снижено с 4000
-        Tunnel443Ms        = 2000    # Снижено с 7000
-        HttpGstaticMs      = 1300    # Снижено с 5000
-        HttpSlowWarnMs     = 1500    # Снижено с 4800
-        PauseAfterTcpMs    = 60      # Снижено с 120
-        PauseAfterTunnelMs = 60      # Снижено с 150
-        PauseAfterHttpMs   = 80      # Снижено с 200
+        DetectTcpConnectMs = 700
+        DetectStreamRwMs   = 800
+        QuickTunnelMs      = 2000
+        TcpToProxyMs       = 1500
+        Tunnel443Ms        = 2000
+        HttpGstaticMs      = 1300
+        HttpSlowWarnMs     = 1500
+        PauseAfterTcpMs    = 60
+        PauseAfterTunnelMs = 60
+        PauseAfterHttpMs   = 80
     }
     UiScan = @{
-        StatusBarThrottleCollectMs = 90   # Снижено с 240
-        StatusBarThrottleRevealMs  = 110  # Снижено с 280
+        StatusBarThrottleCollectMs = 90
+        StatusBarThrottleRevealMs  = 110
         RevealAnimFps            = 48
         ResizeDebounceMs         = 180
     }
     Internet = @{
-        PingTimeoutMs    = 400    # Снижено с 1000
-        TcpFallbackMs    = 400    # Снижено с 1000
+        PingTimeoutMs    = 400
+        TcpFallbackMs    = 400
     }
     HttpMisc = @{
-        GitHubReleaseApiMs      = 1500   # Снижено с 5000
-        RedirectorViaProxyMs    = 1200   # Снижено с 3000
-        GeoProviderViaProxyMs   = 500    # Снижено с 1500
+        GitHubReleaseApiMs      = 1500
+        RedirectorViaProxyMs    = 1200
+        GeoProviderViaProxyMs   = 500
     }
     Quic = @{
         TimeoutMs     = 1200
@@ -330,7 +330,7 @@ function Write-DebugLogSessionHeaderIfNeeded {
         Write-DebugLog "Архитектура: OS 64-bit=$([System.Environment]::Is64BitOperatingSystem), процесс PowerShell 64-bit=$([System.Environment]::Is64BitProcess)" "INFO"
     } catch { }
 
-    # ---------- СТАТУС ЗАГРУЗКИ ЦЕЛЕЙ ----------
+    # ---------- статус загрузки целей ----------
     if (Get-Variable -Name BaseTargets -Scope Script -ErrorAction SilentlyContinue) {
         $targetsCount = $BaseTargets.Count
         if ($script:CustomTargetsLoaded) {
@@ -681,24 +681,33 @@ public class TlsScanner {
                 if (read < 5) return "DRP";
 
                 // 0x16 = Handshake (Server Hello) - Успех
-                if (header[0] == 0x16) return "OK";
-
                 // 0x15 = TLS Alert. Если сервер прислал это, значит пакет валиден,
-                // но серверу что-то не нравится. Для теста доступности это "OK" (сервер ответил).
-                if (header[0] == 0x15) return "OK";
+				// но серверу что-то не нравится. Для теста доступности это "OK" (сервер ответил).
+				// 0x16 = Handshake (Server Hello) - Успех
+				if (header[0] == 0x16) return "OK";
+
+				// 0x15 = TLS Alert. Сервер отверг наш CH (или SNI не понравился).
+				if (header[0] == 0x15) {
+					byte[] desc = new byte[2];
+					int r = stream.Read(desc, 0, 2);
+					if (r == 2) {
+						switch (desc[1]) {
+							case 0x28: return "ALERT_HANDSHAKE";     // 40 handshake_failure
+							case 0x2f: return "ALERT_INAPPROPRIATE"; // 47 illegal_parameter
+							case 0x46: return "ALERT_PROTOCOL";      // 70 protocol_version
+							case 0x70: return "ALERT_NO_ALPN";       // 112 unrecognized_name
+							case 0x78: return "ALERT_NO_APP_PROTO";  // 120 no_application_protocol
+							default:   return "ALERT_" + desc[1].ToString("X2");
+						}
+					}
+					return "ALERT";
+				}
 
                 return "DRP";
             }
-        } catch (System.Net.Sockets.SocketException sex) {
-            switch (sex.SocketErrorCode) {
-                case System.Net.Sockets.SocketError.ConnectionReset:   return "RST";
-                case System.Net.Sockets.SocketError.TimedOut:          return "TIMEOUT";
-                case System.Net.Sockets.SocketError.ConnectionRefused: return "REFUSED";
-                default: return "DRP";
-            }
-        } catch (System.IO.IOException) {
-            return "DRP";
-        } catch (Exception) {
+        } catch (Exception ex) {
+            string m = ex.Message.ToLower();
+            if (m.Contains("reset") || m.Contains("closed")) return "RST";
             return "DRP";
         }
     }
@@ -715,24 +724,27 @@ public class TlsScanner {
 
     private static byte[] BuildModernHello(string host) {
         List<byte> body = new List<byte>();
-        body.AddRange(new byte[] { 0x03, 0x03 }); // legacy_version
+        body.AddRange(new byte[] { 0x03, 0x03 }); // legacy_version = TLS 1.2 (middlebox compat)
 
         byte[] random = new byte[32];
         FillRandomBytes(random);
         body.AddRange(random);
 
-        body.Add(0x00); // legacy_session_id length = 0
+        // session_id (middlebox compat, 32 байта)
+        body.Add(0x20);
+        byte[] sessId = new byte[32]; FillRandomBytes(sessId);
+        body.AddRange(sessId);
 
-        // Cipher Suites
-        body.AddRange(new byte[] { 0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03 });
+        // cipher_suites: TLS 1.3 + TLS 1.2 fallback
+        body.AddRange(new byte[] { 0x00, 0x0a, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2f, 0xc0, 0x30 });
 
-        // Compression Methods
+        // compression_methods = [null]
         body.Add(0x01);
         body.Add(0x00);
 
         List<byte> exts = new List<byte>();
 
-        // SNI
+        // 1. SNI
         byte[] h = Encoding.ASCII.GetBytes(host);
         exts.AddRange(new byte[] { 0x00, 0x00 });
         int sniLen = h.Length + 5;
@@ -742,29 +754,62 @@ public class TlsScanner {
         exts.Add((byte)(h.Length >> 8)); exts.Add((byte)(h.Length & 0xFF));
         exts.AddRange(h);
 
-        // Extended Master Secret
+        // 2. extended_master_secret
         exts.AddRange(new byte[] { 0x00, 0x17, 0x00, 0x00 });
-        // Supported Groups (x25519)
-        exts.AddRange(new byte[] { 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d });
-        // Signature Algorithms
-        exts.AddRange(new byte[] { 0x00, 0x0d, 0x00, 0x08, 0x00, 0x06, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01 });
-        // Supported Versions (TLS 1.3)
-        exts.AddRange(new byte[] { 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 });
-        // PSK Key Exchange Modes
-        exts.AddRange(new byte[] { 0x00, 0x2d, 0x00, 0x02, 0x01, 0x01 });
-        // Key Share (x25519)
+
+        // 3. supported_groups
+        exts.AddRange(new byte[] { 0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17 });
+
+        // 4. signature_algorithms
+        exts.AddRange(new byte[] {
+            0x00, 0x0d, 0x00, 0x0e, 0x00, 0x0c,
+            0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01
+        });
+
+        // 4b. signature_algorithms_cert (0x0032) — Chrome шлёт всегда
+        exts.AddRange(new byte[] {
+            0x00, 0x32, 0x00, 0x0e, 0x00, 0x0c,
+            0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01
+        });
+
+        // 5. ALPN
+        byte[] alpnH2 = Encoding.ASCII.GetBytes("h2");
+        byte[] alpnH1 = Encoding.ASCII.GetBytes("http/1.1");
+        int alpnListLen = 1 + alpnH2.Length + 1 + alpnH1.Length;
+        exts.AddRange(new byte[] { 0x00, 0x10 });
+        exts.Add((byte)((alpnListLen + 2) >> 8)); exts.Add((byte)((alpnListLen + 2) & 0xFF));
+        exts.Add((byte)(alpnListLen >> 8));      exts.Add((byte)(alpnListLen & 0xFF));
+        exts.Add((byte)alpnH2.Length); exts.AddRange(alpnH2);
+        exts.Add((byte)alpnH1.Length); exts.AddRange(alpnH1);
+
+        // 6. status_request
+        exts.AddRange(new byte[] { 0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 });
+
+        // 7. supported_versions — TLS 1.3 + TLS 1.2 fallback (как Chrome)
+        exts.AddRange(new byte[] { 0x00, 0x2b, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03 });
+
+        // 8. key_share (без psk_key_exchange_modes — мы не используем PSK)
         exts.AddRange(new byte[] { 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 });
         byte[] key = new byte[32]; FillRandomBytes(key);
         exts.AddRange(key);
 
-        body.Add((byte)(exts.Count >> 8));
-        body.Add((byte)(exts.Count & 0xFF));
+        body.Add((byte)(exts.Count >> 8)); body.Add((byte)(exts.Count & 0xFF));
         body.AddRange(exts);
 
+        // Handshake header: ClientHello type + 3-byte length
+        List<byte> hs = new List<byte> { 0x01 };   // 0x01 = ClientHello
+        int hl = body.Count;
+        hs.Add((byte)((hl >> 16) & 0xFF));
+        hs.Add((byte)((hl >> 8) & 0xFF));
+        hs.Add((byte)(hl & 0xFF));
+        hs.AddRange(body);
+
+        // Record header + handshake message
         List<byte> pkt = new List<byte> { 0x16, 0x03, 0x01 };
-        pkt.Add((byte)(body.Count >> 8));
-        pkt.Add((byte)(body.Count & 0xFF));
-        pkt.AddRange(body);
+        int pktLen = hs.Count;
+        pkt.Add((byte)((pktLen >> 8) & 0xFF));
+        pkt.Add((byte)(pktLen & 0xFF));
+        pkt.AddRange(hs);
         return pkt.ToArray();
     }
 }
@@ -1046,6 +1091,32 @@ function Get-GeoProviderDefinitions {
             Check  = { param($j) -not $j.error -and $j.org -and $j.country }
             GetISP = { param($j) ($j.org -split '\s+', 3)[0..1] -join ' ' }
             GetLOC = { param($j) "$($j.city), $($j.country)" }
+        }
+        [PSCustomObject]@{
+            Name   = "ifconfig.co"
+            Url    = "https://ifconfig.co/json"
+            Check  = { param($j) ($j.asn_org -or $j.org) -and ($j.country_iso -or $j.country) }
+            GetISP = { param($j) if ($j.asn_org) { $j.asn_org } else { $j.org } }
+            GetLOC = {
+                param($j)
+                $city = if ($j.city) { [string]$j.city } else { "" }
+                $cc = if ($j.country_iso) { [string]$j.country_iso } elseif ($j.country) { [string]$j.country } else { "" }
+                if ($city) { "$city, $cc" } else { $cc }
+            }
+        }
+        [PSCustomObject]@{
+            Name   = "ip-api.com"
+            Url    = "https://ip-api.com/json/?fields=status,countryCode,city,isp"
+            Check  = { param($j) $j.status -eq "success" -and $j.isp }
+            GetISP = { param($j) $j.isp }
+            GetLOC = { param($j) "$($j.city), $($j.countryCode)" }
+        }
+        [PSCustomObject]@{
+            Name   = "ipapi.co"
+            Url    = "https://ipapi.co/json/"
+            Check  = { param($j) -not $j.error -and $j.org -and $j.country_code }
+            GetISP = { param($j) $j.org }
+            GetLOC = { param($j) "$($j.city), $($j.country_code)" }
         }
     )
 }
@@ -1352,29 +1423,13 @@ function Initialize-Targets {
     # Дефолтный список
     Write-DebugLog "Переключение на встроенный (дефолтный) список целей." "INFO"
     $defaultTargets = @(
-        # --- Основные домены YouTube ---
-        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
-        "youtube-nocookie.com", "www.youtube-nocookie.com", "youtubekids.com",
-        "music.youtube.com", "studio.youtube.com", "tv.youtube.com",
-
-        # --- API и сервисы Google (критично для работы приложений) ---
-        "youtubei.googleapis.com", "youtubeembeddedplayer.googleapis.com",
-        "youtube.googleapis.com", "youtubegaming.googleapis.com",
-        "signaler-pa.youtube.com", "jnn-pa.googleapis.com",
-
-        # --- Доставка контента (видео, превью) ---
-        "googlevideo.com", "manifest.googlevideo.com", "redirector.googlevideo.com",
-        "i.ytimg.com", "s.ytimg.com", "i9.ytimg.com",
-        "yt3.ggpht.com", "yt4.ggpht.com", "yt3.googleusercontent.com",
-
-        # --- Инфраструктурные домены Google (часто блокируются в комплексе) ---
-        "googleapis.com", "play.google.com", "accounts.google.com",
-        "clients6.google.com", "video.google.com",
-        "youtube-ui.l.google.com", "ytimg.l.google.com", "ytstatic.l.google.com",
-        "wide-youtube.l.google.com", "yt-video-upload.l.google.com",
-
-        # --- Региональные и вспомогательные (могут понадобиться) ---
-        "youtubeeducation.com"
+        "accounts.google.com", "clients6.google.com", "googlevideo.com",
+        "googleapis.com", "i.ytimg.com", "m.youtube.com", "manifest.googlevideo.com",
+        "music.youtube.com", "play.google.com", "redirector.googlevideo.com",
+        "s.ytimg.com", "s.youtube.com", "signaler-pa.youtube.com", "studio.youtube.com",
+        "tv.youtube.com", "video.google.com", "www.youtube-nocookie.com", "www.youtube.com",
+        "yt3.ggpht.com", "yt4.ggpht.com", "youtu.be", "youtube.com",
+        "youtubeembeddedplayer.googleapis.com", "youtubei.googleapis.com", "youtubekids.com"
     )
     $script:BaseTargets = $defaultTargets
     $script:CustomTargetsLoaded = $false
@@ -1426,8 +1481,7 @@ function Out-Str($x, $y, $str, $color="White", $bg="Black") {
 
 
 # ====================================================================================
-# YT-DPI 3.0 TUI ENGINE (classic NAV/STATUS footer + PATH mtr-lite)
-# UiFrame / Flush-UiFrame reserved for 3.1 — not used by Draw-UI yet.
+# YT-DPI 3.0 TUI ENGINE
 # ====================================================================================
 
 $script:UiMode = "Scan"   # Scan | Extra | Dns | Path
@@ -2175,6 +2229,16 @@ function Draw-ExtraStrip {
 function Format-TlsCellDisplay {
     param([string]$Cell, [string]$RstPhase)
     if ($Cell -eq "RST" -and $RstPhase -eq "RST_CH") { return "RST*" }
+    if ($Cell -match '^ALERT_') {
+        switch -Regex ($Cell) {
+            'ALERT_INAPPROPRIATE' { return "A-ILLEG" }   # 7 chars
+            'ALERT_HANDSHAKE'     { return "A-HSFLR" }   # 7
+            'ALERT_PROTOCOL'      { return "A-PROTO" }   # 7
+            'ALERT_NO_ALPN'       { return "A-NOALP" }   # 7
+            'ALERT_NO_APP_PROTO'  { return "A-NOAPP" }   # 7
+            default               { return "A-XX"     }
+        }
+    }
     return $Cell
 }
 
@@ -3349,6 +3413,12 @@ function Draw-UI ($NetInfo, $Targets, $Results, $ClearScreen = $true) {
     [Console]::CursorVisible = $false
     Sync-DynamicColPosFromLayout
     Update-UiConsoleSnapshot
+}
+
+
+function Get-ScanAnim($f, $row) {
+    $frames = "[=   ]", "[ =  ]", "[  = ]", "[   =]", "[  = ]", "[ =  ]"
+    return $frames[($f + $row) % $frames.Length]
 }
 
 function Write-ResultLine {
@@ -6378,6 +6448,7 @@ function Invoke-DnsScanAction {
     Clear-KeyBuffer
 }
 
+
 # ====================================================================================
 # EXTRA DIAGNOSTICS
 # ====================================================================================
@@ -6818,15 +6889,16 @@ function Invoke-IpVsSniProbe {
     $to = [int]$CONST.IpVsSni.TimeoutMs
 
     function Probe-Sni([string]$sni) {
-        try {
-            $cell = [TlsScanner]::TestT13($ipStr, $sni, "", 0, "", "", $to)
-            return [string]$cell
-        } catch {
-            $m = $_.Exception.Message
-            if ($m -match "reset|forcibly") { return "RST" }
-            return "DRP"
-        }
-    }
+		try {
+			$cell = [TlsScanner]::TestT13($ipStr, $sni, "", 0, "", "", $to)
+			if ($cell -match '^ALERT_') { return "OK" }   # ← добавить эту строку
+			return [string]$cell
+		} catch {
+			$m = $_.Exception.Message
+			if ($m -match "reset|forcibly") { return "RST" }
+			return "DRP"
+		}
+	}
 
     $yt = Probe-Sni $ytSni
     $ctrl = Probe-Sni $ctrlSni
@@ -7327,6 +7399,7 @@ Draw-StatusBar
 Write-DebugLog "--- СИСТЕМА ГОТОВА ---" "INFO"
 Clear-KeyBuffer
 $FirstRun = $false
+
 
 
 function Start-MainLoop {

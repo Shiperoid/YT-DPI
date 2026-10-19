@@ -21,7 +21,7 @@ if not exist "%SCRIPT_PATH%" (
     )
 )
 
-title YT-DPI v3.0.1
+title YT-DPI v3.0.2
 "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_PATH%" %*
 endlocal
 exit /b %ERRORLEVEL%
